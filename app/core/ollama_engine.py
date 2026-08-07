@@ -1,39 +1,28 @@
-"""
-Module: ollama_engine
-Nhiệm vụ: Quản lý kết nối và thực hiện truy vấn với Ollama Server, sử dụng mô hình Qwen-VL (hoặc Qwen2.5/Qwen3.5) để nhận diện văn bản (OCR) từ hình ảnh.
-"""
-
 from pathlib import Path
 
 # pyrefly: ignore [missing-import]
 from ollama import Client
 
 
-# Prompt hướng dẫn mô hình chuyển đổi ảnh tài liệu thành định dạng Markdown chuẩn
 OCR_PROMPT = """
-Bạn là hệ thống OCR chính xác cao cho tài liệu scan.
+Chuyển toàn bộ nội dung nhìn thấy trong ảnh tài liệu scan thành Markdown.
 
-Nhiệm vụ: chép lại toàn bộ chữ nhìn thấy trong ảnh thành Markdown.
-
-Quy tắc bắt buộc:
-- Chỉ chép nội dung thực sự nhìn thấy; không suy diễn hoặc bổ sung.
-- Giữ nguyên ngôn ngữ, dấu tiếng Việt, chính tả, số, ký hiệu và xuống dòng.
-- Nếu chữ hoặc ký hiệu không đọc được, ghi `[không rõ]`; không đoán.
-- Giữ thứ tự đọc tự nhiên. Với tài liệu nhiều cột: đọc hết cột trái, sau đó mới đến cột phải.
-- Giữ tiêu đề, các cấp heading, đoạn văn, danh sách, chú thích, đầu trang và cuối trang.
-- Chuyển bảng sang Markdown. Nếu bảng phức tạp, có gộp ô hoặc Markdown làm mất cấu trúc, dùng HTML `<table>`.
-- Chuyển công thức toán học sang LaTex, dùng `$...$` hoặc `$$...$$` khi phù hợp.
-- Không tóm tắt, giải thích, dịch, sửa chính tả hay mô tả ảnh.
-- Không bọc kết quả trong khối mã Markdown.
-- Chỉ trả về nội dung Markdown.
+Yêu cầu:
+- Sao chép chính xác nội dung.
+- Giữ nguyên tiếng Việt.
+- Giữ đúng thứ tự đọc.
+- Giữ heading, đoạn văn và danh sách.
+- Chuyển bảng sang Markdown hoặc HTML.
+- Công thức chuyển sang LaTeX.
+- Không tóm tắt.
+- Không giải thích.
+- Không sửa nội dung gốc.
+- Không thêm thông tin.
+- Chỉ trả Markdown.
 """.strip()
 
 
 class OllamaQwenEngine:
-    """
-    Lớp Engine điều phối giao tiếp với Ollama API.
-    Nhiệm vụ chính: Gửi ảnh kèm prompt OCR và dọn dẹp kết quả Markdown trả về.
-    """
 
     def __init__(
         self,
