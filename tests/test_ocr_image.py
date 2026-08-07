@@ -1,4 +1,5 @@
 from pathlib import Path
+from time import perf_counter
 
 from ollama import Client
 
@@ -26,19 +27,27 @@ Yêu cầu bắt buộc:
 
 def main():
     image_path = Path(
-        "samples/images/test.png"
+        "samples/images/test.jpg"
     ).resolve()
 
+    print(f"[1/3] Đang kiểm tra ảnh: {image_path}", flush=True)
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Không tìm thấy ảnh đầu vào: {image_path}")
+    print(f"      Kích thước ảnh: {image_path.stat().st_size:,} bytes", flush=True)
+
+    print("[2/3] Đang kết nối Ollama tại http://localhost:11434...", flush=True)
     client = Client(
         host="http://localhost:11434"
     )
 
-    response = client.generate(
+    print(f"[3/3] Đang OCR bằng {MODEL}. Token sẽ hiện bên dưới khi model bắt đầu trả lời:", flush=True)
+    started_at = perf_counter()
+    stream = client.generate(
         model=MODEL,
         prompt=PROMPT,
         images=[str(image_path)],
         think=False,
-        stream=False,
+        stream=True,
         options={
             "temperature": 0,
             "num_ctx": 8192,
@@ -47,7 +56,21 @@ def main():
         keep_alive="10m",
     )
 
-    print(response.response)
+    ocr_result = []
+    for chunk in stream:
+        content = chunk.response
+        print(content, end="", flush=True)
+        ocr_result.append(content)
+
+    elapsed = perf_counter() - started_at
+    print(f"\n\nHoàn tất OCR trong {elapsed:.1f} giây.", flush=True)
+
+    # Lưu kết quả ra file
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+    output_file = output_dir / "test_result.md"
+    output_file.write_text("".join(ocr_result), encoding="utf-8")
+    print(f"Đã lưu kết quả tại: {output_file.as_posix()}", flush=True)
 
 
 if __name__ == "__main__":

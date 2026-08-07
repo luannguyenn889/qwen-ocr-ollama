@@ -1,0 +1,55 @@
+# HƯỚNG DẪN CHẠY CÁC FILE KIỂM THỬ (TEST FILES)
+==============================================
+
+Dự án này sử dụng môi trường ảo Python đặt tại thư mục `.venv`. Dưới đây là hướng dẫn đầy đủ để chạy từng file kiểm thử (test).
+
+---
+
+## 1. Đảm bảo trước khi chạy:
+- Ứng dụng **Ollama** đang được mở và chạy trên máy tính của bạn.
+- Model **`qwen3.5:4b`** đã được tải về thành công (kiểm tra bằng cách chạy lệnh `ollama list`).
+
+---
+
+## 2. Cách chạy trực tiếp (Không cần kích hoạt môi trường ảo)
+Đây là cách nhanh nhất bằng việc gọi trực tiếp file thực thi Python nằm trong thư mục `.venv`:
+
+### a. Kiểm tra kết nối Ollama cơ bản:
+```powershell
+.\.venv\Scripts\python.exe tests/test_ollama.py
+```
+
+### b. Kiểm tra OCR hình ảnh đơn lẻ:
+*(Chương trình sẽ OCR ảnh `samples/images/test.jpg` và tự động lưu kết quả vào thư mục `output/test_result.md`)*
+```powershell
+.\.venv\Scripts\python.exe tests/test_ocr_image.py
+```
+
+### c. Kiểm tra OCR tài liệu PDF:
+*(Chương trình sẽ tách các trang PDF trong `samples/pdfs/test.pdf` thành hình ảnh tạm thời rồi tiến hành OCR từng trang)*
+```powershell
+.\.venv\Scripts\python.exe tests/test_pdf.py
+```
+
+---
+
+## 3. Cách chạy sau khi kích hoạt môi trường ảo (venv)
+Nếu bạn muốn sử dụng từ khóa `python` ngắn gọn:
+
+### Bước 1: Kích hoạt venv
+- **Trên PowerShell**:
+  ```powershell
+  .\.venv\Scripts\Activate.ps1
+  ```
+- **Trên Command Prompt (CMD)**:
+  ```cmd
+  .\.venv\Scripts\activate.bat
+  ```
+*(Khi kích hoạt thành công, bạn sẽ thấy chữ `(.venv)` xuất hiện ở đầu dòng lệnh Terminal)*.
+
+### Bước 2: Chạy các file test:
+```powershell
+python tests/test_ollama.py
+python tests/test_ocr_image.py
+python tests/test_pdf.py
+```

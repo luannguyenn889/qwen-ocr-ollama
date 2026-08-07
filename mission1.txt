@@ -1,0 +1,43 @@
+Benchmark ảnh
+
+Không làm PDF vội.
+
+Chuẩn bị khoảng 10 ảnh:
+
+01_scan_ro.png
+02_scan_mo.png
+03_nghieng.png
+04_bang.png
+05_hai_cot.png
+06_cong_thuc.png
+07_viet_anh.png
+08_photo_cu.png
+09_chu_nho.png
+10_layout_phuc_tap.png
+
+Đo:
+
+- Thời gian/ảnh
+- RAM
+- VRAM
+- Độ chính xác
+- Markdown
+
+Dùng:
+
+nvidia-smi -l 1
+Quyết định ngày 10/08
+
+Nếu Qwen:
+
+[✓] OCR tiếng Việt tốt
+[✓] Không lỗi model
+[✓] Tốc độ chấp nhận được
+[✓] Không hết RAM/VRAM
+
+→ tiếp tục.
+
+Nếu không:
+
+Qwen → benchmark
+PaddleOCR → fallback
