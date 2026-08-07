@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 from ollama import Client
 
 print("Đang gọi Ollama...", flush=True)
