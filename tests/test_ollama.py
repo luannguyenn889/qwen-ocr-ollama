@@ -1,3 +1,5 @@
+# Nhiệm vụ: Kiểm tra kết nối cơ bản tới Ollama server và test tính năng sinh văn bản (text generation) đơn giản bằng model qwen3.5:4b.
+
 # pyrefly: ignore [missing-import]
 from ollama import Client
 

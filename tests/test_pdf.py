@@ -1,3 +1,5 @@
+# Nhiệm vụ: Kiểm tra quy trình trích xuất trang PDF, render thành ảnh tạm thời, thực hiện OCR từng trang bằng OllamaQwenEngine và in kết quả ra terminal để kiểm tra nhanh.
+
 import sys
 import tempfile
 from pathlib import Path

@@ -1,3 +1,5 @@
+# Nhiệm vụ: Đánh giá hiệu năng (Benchmark) OCR trên bộ 10 ảnh mẫu: đo thời gian, dung lượng RAM sử dụng, VRAM GPU đỉnh (qua nvidia-smi) và tính toán độ chính xác (so với Ground Truth).
+
 """Benchmark OCR cho 10 ảnh mẫu.
 
 Chạy trực tiếp:

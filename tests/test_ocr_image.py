@@ -1,3 +1,5 @@
+# Nhiệm vụ: Kiểm tra quy trình OCR một file ảnh đơn lẻ (samples/images/test.jpg) qua thư viện Ollama, in trực tiếp kết quả Markdown theo thời gian thực (stream) và lưu vào thư mục output/test_result.md.
+
 from pathlib import Path
 from time import perf_counter
 
@@ -27,9 +29,10 @@ Yêu cầu bắt buộc:
 
 
 def main():
-    image_path = Path(
-        "samples/images/test.jpg"
-    ).resolve()
+    # image_path = Path(
+    #     "samples/images/test.jpg"
+    # ).resolve()
+    image_path = Path("samples/images/testparagraph.png").resolve()
 
     print(f"[1/3] Đang kiểm tra ảnh: {image_path}", flush=True)
     if not image_path.is_file():

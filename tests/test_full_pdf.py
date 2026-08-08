@@ -1,3 +1,5 @@
+# Nhiệm vụ: Kiểm tra việc OCR toàn bộ các trang của file PDF (samples/pdfs/test.pdf) và gộp/lưu kết quả hoàn chỉnh thành một file Markdown duy nhất trong thư mục output.
+
 import sys
 from pathlib import Path
 from time import perf_counter
