@@ -32,7 +32,8 @@ def main():
     # image_path = Path(
     #     "samples/images/test.jpg"
     # ).resolve()
-    image_path = Path("samples/images/testparagraph.png").resolve()
+    # image_path = Path("samples/images/testparagraph.png").resolve()
+    image_path = Path("samples/images/devan12.jpeg").resolve()
 
     print(f"[1/3] Đang kiểm tra ảnh: {image_path}", flush=True)
     if not image_path.is_file():
@@ -72,7 +73,7 @@ def main():
     # Lưu kết quả ra file
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
-    output_file = output_dir / "test_result.md"
+    output_file = output_dir / "test_result3.md"
     output_file.write_text("".join(ocr_result), encoding="utf-8")
     print(f"Đã lưu kết quả tại: {output_file.as_posix()}", flush=True)
 

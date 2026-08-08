@@ -4,12 +4,14 @@ Nhiệm vụ: Chuyển đổi các trang của tệp tài liệu PDF thành hìn
 """
 
 from pathlib import Path
+# pyrefly: ignore [missing-import]
 import pymupdf
 
 def render_pdf_to_images(
     pdf_path: str | Path,
     output_dir: str | Path,
-    dpi: int = 200,
+    # dpi: int = 200,
+    dpi: int = 300,
 ) -> list[Path]:
     """
     Chuyển đổi từng trang của file PDF thành ảnh PNG.

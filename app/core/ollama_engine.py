@@ -7,18 +7,17 @@ from ollama import Client
 OCR_PROMPT = """
 Chuyển toàn bộ nội dung nhìn thấy trong ảnh tài liệu scan thành Markdown.
 
-Yêu cầu:
-- Sao chép chính xác nội dung.
-- Giữ nguyên tiếng Việt.
-- Giữ đúng thứ tự đọc.
-- Giữ heading, đoạn văn và danh sách.
-- Chuyển bảng sang Markdown hoặc HTML.
-- Công thức chuyển sang LaTeX.
-- Không tóm tắt.
-- Không giải thích.
-- Không sửa nội dung gốc.
-- Không thêm thông tin.
-- Chỉ trả Markdown.
+Yêu cầu về công thức toán học (BẮT BUỘC):
+- Tất cả biểu thức toán học, ký hiệu, biến số (ví dụ: x, y, a, b), chỉ số (trên/dưới), phân số, căn thức, tích phân, vector hay ma trận phải được bao bọc bằng định dạng LaTeX.
+- Sử dụng dấu $...$ cho công thức nằm trong cùng dòng văn bản (ví dụ: $f(x) = ax^2 + bx + c$, vector $\vec{a}$).
+- Sử dụng dấu $$...$$ đặt ở dòng riêng biệt cho các phương trình lớn hoặc công thức độc lập.
+- Sử dụng chính xác các ký hiệu toán học tiêu chuẩn của LaTeX (như \\sin, \\cos, \\pi, \\alpha, \\beta, \\rightarrow, \\cap, \\cup, \\emptyset, \\vec{a}).
+
+Yêu cầu chung:
+- Sao chép chính xác nội dung, giữ nguyên tiếng Việt và thứ tự đọc.
+- Giữ tiêu đề, đoạn văn, danh sách và bảng biểu.
+- Không tự giải thích công thức, không viết thêm lời dẫn giải, không sửa đổi chính tả gốc.
+- Chỉ trả về duy nhất nội dung văn bản Markdown.
 """.strip()
 
 
