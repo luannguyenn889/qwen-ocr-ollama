@@ -12,6 +12,11 @@ __pycache__/
 # Logs and outputs
 logs/
 output/
+OCR/
+PDF/
+test_hybrid_out/
+scratch_images/
+page_*.png
 *.log
 
 # Environment variables / secrets

@@ -32,8 +32,8 @@ def main():
     # image_path = Path(
     #     "samples/images/test.jpg"
     # ).resolve()
-    # image_path = Path("samples/images/testparagraph.png").resolve()
-    image_path = Path("samples/images/devan12.jpeg").resolve()
+    image_path = Path("samples/images/testparagraph.png").resolve()
+    # image_path = Path("samples/images/devan12.jpeg").resolve()
 
     print(f"[1/3] Đang kiểm tra ảnh: {image_path}", flush=True)
     if not image_path.is_file():
