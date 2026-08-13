@@ -37,7 +37,10 @@ Convert this scanned document to Markdown format according to the following requ
    - Return only the raw Markdown content, do not wrap it inside ```markdown code blocks.
 """.strip()
 
+
+# Hàm làm sạch sơ bộ văn bản Markdown đầu ra
 def clean_markdown(text: str) -> str:
+    """Làm sạch các rào chắn mã Markdown dư thừa, khoảng trắng HTML và sửa lại khối công thức toán trắc nghiệm."""
     import re
     text = text.strip()
     if text.startswith("```markdown"):
@@ -48,11 +51,11 @@ def clean_markdown(text: str) -> str:
         text = text[:-3]
     text = text.strip()
     
-    # Clean up HTML space entities
+    # Loại bỏ khoảng trắng HTML
     text = text.replace("&nbsp;", " ")
     text = text.replace("&amp;nbsp;", " ")
     
-    # Fix math block spanning multiple options (e.g. A. $... B. ...$)
+    # Phân tách công thức bị gộp của các lựa chọn trắc nghiệm
     def repl(match):
         content = match.group(1)
         parts = re.split(r"(\s+[B-D]\.\s+)", content)
@@ -73,9 +76,12 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r"\$([^$\n]+)\$", repl, text)
     return text
 
+
+# Hàm main điều khiển tiến trình ghép nối OCR
 def main():
+    """Quét các ảnh page_*.png, chạy nhận diện OCR và ghi ghép nối thành file test.md."""
     root_dir = Path(".").resolve()
-    # Find page_X.png files, sort them by page number
+    # Tìm các tệp page_X.png, sắp xếp theo thứ tự số trang tăng dần
     image_paths = sorted(
         list(root_dir.glob("page_*.png")),
         key=lambda p: int(p.stem.split("_")[1])
@@ -114,7 +120,7 @@ def main():
             elapsed = perf_counter() - started_at
             print(f"Page {page_num} completed in {elapsed:.1f} seconds.", flush=True)
             
-            # Stitch with separators
+            # Ghép nối có phân tách trang
             f.write(f"<!-- Page {page_num} -->\n\n")
             f.write(page_markdown)
             f.write("\n\n")
@@ -123,3 +129,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

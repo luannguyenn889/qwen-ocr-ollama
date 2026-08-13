@@ -13,17 +13,46 @@ import threading
 import queue
 import tempfile
 import time
+import time
+import gc
+
+def generate_with_retry(client, kwargs, progress_queue, max_retries=3, log_prefix=""):
+    last_err: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.generate(**kwargs)
+        except Exception as error:
+            last_err = error
+            progress_queue.put(
+                ("log", f"{log_prefix} [Chú ý] Lỗi Ollama "
+                        f"(lần thử {attempt}/{max_retries}): {error}\n")
+            )
+            if attempt < max_retries:
+                time.sleep(2)
+                gc.collect()
+
+    if last_err is not None:
+        raise last_err
+
+    raise RuntimeError("Không thể gọi Ollama: không có lần thử nào được thực hiện")
+
 import re
 from pathlib import Path
-from PIL import Image, ImageTk
+# pyrefly: ignore [missing-import]
+from PIL import Image, ImageTk 
 # pyrefly: ignore [missing-import]
 import pymupdf  # PyMuPDF 
 # pyrefly: ignore [missing-import]
 from ollama import Client
 from app.core.batch_ocr import (
     ENABLE_LAYOUT_DETECTION, TABLE_HTML_RETRY_INSTRUCTION, TABLE_RENDER_DPI, TABLE_SAFE_INSTRUCTION,
-    TABLE_STRUCTURE_REPAIR_PROMPT, link_extracted_images,
-    needs_table_retry, page_is_tiled_scan, render_table_page, resolve_qwen_model,
+    TABLE_STRUCTURE_REPAIR_PROMPT, clean_markdown as core_clean_markdown,
+    QUALITY_RETRY_INSTRUCTION, apply_page_assets,
+    extract_images_from_page as core_extract_images_from_page,
+    finalize_markdown, link_extracted_images,
+    needs_table_retry, normalize_worker_count, page_is_tiled_scan, render_table_page, resolve_qwen_model,
+    ocr_coordinate_blocks, ocr_qwen_images, PipelineCancelled,
 )
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -346,16 +375,42 @@ def post_process_markdown(text: str) -> str:
         result,
     )
 
+
+# The desktop frontend deliberately delegates OCR helpers to the core pipeline.
+# Legacy local definitions above remain temporarily for source compatibility but
+# are not used by OCRWorker.
+extract_images_from_page = core_extract_images_from_page
+clean_markdown = core_clean_markdown
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds for compact, readable GUI logs."""
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} giờ {minutes} phút {secs} giây"
+    if minutes:
+        return f"{minutes} phút {secs} giây"
+    return f"{secs} giây"
+
+
 class OCRWorker:
-    def __init__(self, target_path: Path, output_dir: Path, progress_queue: queue.Queue, stop_event: threading.Event, model_name: str):
+    def __init__(self, target_path: Path, output_dir: Path, progress_queue: queue.Queue, stop_event: threading.Event, resume_event: threading.Event, model_name: str, workers: int = 1):
+        self.workers = normalize_worker_count(workers, model_name)
+        self.layout_lock = threading.Lock()
+        self.progress_lock = threading.Lock()
+        self.pages_processed = 0
         self.target_path = target_path
         self.output_dir = output_dir
         self.progress_queue = progress_queue
         self.stop_event = stop_event
+        self.resume_event = resume_event
         self.model_name = model_name
         self.client = Client(host="http://localhost:11434")
 
     def run(self):
+        batch_start_time = time.perf_counter()
         try:
             # 1. Collect PDFs
             pdf_files = []
@@ -371,8 +426,13 @@ class OCRWorker:
 
             total_files = len(pdf_files)
             self.progress_queue.put(("log", f"Bắt đầu xử lý {total_files} file PDF...\n"))
+            from app.core.formula_ocr import formula_ocr_status
+            _, formula_status = formula_ocr_status()
+            self.progress_queue.put(("log", f"Trạng thái Formula OCR: {formula_status}.\n"))
 
             for file_idx, pdf_path in enumerate(pdf_files, 1):
+                self.pages_processed = 0
+                pdf_start_time = time.perf_counter()
                 if self.stop_event.is_set():
                     break
                 
@@ -415,36 +475,47 @@ class OCRWorker:
                     layout_detector = None
                     if ENABLE_LAYOUT_DETECTION:
                         try:
-                            from app.core.layout_detector import LayoutDetector
-                            layout_detector = LayoutDetector()
-                            self.progress_queue.put(("log", "  - Đã tải Paddle layout detection (không đọc text).\n"))
+                            from app.core.layout_detector import create_layout_detector
+                            layout_detector, layout_status = create_layout_detector()
+                            self.progress_queue.put(("log", f"  - Trạng thái layout: {layout_status}.\n"))
                         except Exception as layout_error:
-                            self.progress_queue.put(("log", f"  - [Chú ý] Layout detection không sẵn sàng: {layout_error}\n"))
+                            self.progress_queue.put(("log", f"  - Trạng thái layout: disabled; dùng nguyên trang ({layout_error}).\n"))
 
-                    for idx, img_path in enumerate(page_images):
+                    def process_page_worker(args):
+                        idx, img_path = args
                         if self.stop_event.is_set():
-                            break
+                            return None
                         
                         page_num = idx + 1
                         self.progress_queue.put(("page_progress", (page_num, total_pages)))
                         self.progress_queue.put(("log", f"  - Đang OCR Trang {page_num}/{total_pages}...\n"))
                         
                         started_at = time.perf_counter()
+                        self.progress_queue.put(("page_timer_start", (page_num, started_at)))
                         paddle_seconds = 0.0
                         qwen_seconds = 0.0
                         extracted_paths = []
                         try:
                             output_img_dir = self.output_dir / "images"
-                            extracted_paths = extract_images_from_page(pdf_path, idx, output_img_dir, pdf_path.stem)
+                            from app.core.batch_ocr import extract_images_from_page
+                            with self.layout_lock:
+                                extracted_paths = extract_images_from_page(
+                                    pdf_path, idx, output_img_dir, pdf_path.stem,
+                                    layout_detector=layout_detector,
+                                    page_image_path=img_path
+                                )
                         except Exception as img_err:
                             self.progress_queue.put(("log", f"    -> [Chú ý] Không thể trích xuất ảnh: {img_err}\n"))
 
                         qwen_images = [img_path]
                         has_table = False
+                        ordered_blocks = []
                         if layout_detector is not None:
                             try:
                                 paddle_started_at = time.perf_counter()
-                                columns, has_table, text_regions, table_regions = layout_detector.analyse_with_regions(img_path)
+                                with self.layout_lock:
+                                    columns, has_table, text_regions, table_regions = layout_detector.analyse_with_regions(img_path)
+                                    ordered_blocks = layout_detector.detect_ordered_blocks(img_path.read_bytes())
                                 paddle_seconds = time.perf_counter() - paddle_started_at
                                 from app.core.layout_detector import save_layout_overlay
                                 overlay_path = save_layout_overlay(
@@ -454,8 +525,8 @@ class OCRWorker:
                                 )
                                 self.progress_queue.put(("layout_overlay", overlay_path))
                                 if len(columns) >= 2:
-                                    from app.core.layout_detector import crop_columns
-                                    qwen_images = crop_columns(img_path, columns, temp_dir_path / "columns")
+                                    from app.core.layout_detector import crop_segments
+                                    qwen_images = crop_segments(img_path, columns, temp_dir_path / "columns")
                                     self.progress_queue.put(("log", f"    -> Phát hiện {len(qwen_images)} cột, đọc từ trái sang phải.\n"))
                                 if has_table:
                                     qwen_images = [render_table_page(pdf_path, idx, temp_dir_path / "table_pages")]
@@ -463,81 +534,123 @@ class OCRWorker:
                             except Exception as layout_error:
                                 self.progress_queue.put(("log", f"    -> [Chú ý] Layout lỗi, dùng nguyên trang: {layout_error}\n"))
                                 qwen_images, has_table = [img_path], False
+                                ordered_blocks = []
 
-                        if is_hybrid:
-                            qwen_started_at = time.perf_counter()
-                            parts = []
-                            for part_index, qwen_image in enumerate(qwen_images):
-                                prompt_suffix = "\n\n" + TABLE_SAFE_INSTRUCTION if has_table else ""
-                                if extracted_paths and part_index == 0:
-                                    prompt_suffix += f"\n\nTrang có {len(extracted_paths)} hình ảnh/sơ đồ; chèn đúng số thẻ ![Mô tả](image_placeholder.png)."
-                                response = self.client.generate(
-                                    model=hybrid_model, prompt=PROMPT + prompt_suffix,
-                                    images=[str(qwen_image)], think=False, stream=False,
-                                    options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096}, keep_alive="10m",
+                        qwen_started_at = time.perf_counter()
+
+                        def before_qwen_request():
+                            self.resume_event.wait()
+                            if self.stop_event.is_set():
+                                raise PipelineCancelled()
+
+                        try:
+                            selected_model = hybrid_model if is_hybrid else resolve_qwen_model(self.model_name)
+                            page_md = ocr_coordinate_blocks(
+                                self.client, selected_model, img_path, ordered_blocks, extracted_paths,
+                                temp_dir_path / "layout_blocks" / f"page_{page_num}",
+                                log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
+                                before_request=before_qwen_request,
+                            )
+                            if page_md is not None:
+                                self.progress_queue.put(("log", "    -> Đã OCR toàn trang một lần và đặt ảnh theo reading order.\n"))
+                            else:
+                                page_md = ocr_qwen_images(
+                                    self.client, selected_model, qwen_images, has_table=has_table,
+                                    log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
+                                    before_request=before_qwen_request,
                                 )
-                                parts.append(clean_markdown(response.response))
-                            page_md = "\n\n".join(part for part in parts if part.strip())
-                            if has_table and needs_table_retry(page_md):
-                                self.progress_queue.put(("log", "    -> Chạy lại table-safe với ảnh nguyên trang.\n"))
-                                response = self.client.generate(
-                                    model=hybrid_model, prompt=PROMPT + "\n\n" + TABLE_SAFE_INSTRUCTION + "\n\n" + TABLE_HTML_RETRY_INSTRUCTION,
-                                    images=[str(qwen_images[0])], think=False, stream=False,
-                                    options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096}, keep_alive="10m",
-                                )
-                                page_md = clean_markdown(response.response)
-                                if needs_table_retry(page_md):
-                                    self.progress_queue.put(("log", "    -> Sửa cấu trúc bảng từ kết quả OCR bị vỡ.\n"))
-                                    response = self.client.generate(
-                                        model=hybrid_model,
-                                        prompt=TABLE_STRUCTURE_REPAIR_PROMPT.format(broken_markdown=page_md),
-                                        images=[str(qwen_images[0])], think=False, stream=False,
-                                        options={"temperature": 0, "num_ctx": 12288, "num_predict": 6144}, keep_alive="10m",
-                                    )
-                                    page_md = clean_markdown(response.response)
-                            qwen_seconds = time.perf_counter() - qwen_started_at
-                        else:
-                            qwen_started_at = time.perf_counter()
-                            parts = []
-                            for part_index, qwen_image in enumerate(qwen_images):
-                                prompt_suffix = "\n\n" + TABLE_SAFE_INSTRUCTION if has_table else ""
-                                response = self.client.generate(model=resolve_qwen_model(self.model_name), prompt=PROMPT + prompt_suffix,
-                                    images=[str(qwen_image)], think=False, stream=False,
-                                    options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096}, keep_alive="10m")
-                                parts.append(clean_markdown(response.response))
-                            page_md = "\n\n".join(part for part in parts if part.strip())
-                            if has_table and needs_table_retry(page_md):
-                                self.progress_queue.put(("log", "    -> Chạy lại table-safe với ảnh nguyên trang.\n"))
-                                response = self.client.generate(
-                                    model=resolve_qwen_model(self.model_name), prompt=PROMPT + "\n\n" + TABLE_SAFE_INSTRUCTION + "\n\n" + TABLE_HTML_RETRY_INSTRUCTION,
-                                    images=[str(qwen_images[0])], think=False, stream=False,
-                                    options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096}, keep_alive="10m",
-                                )
-                                page_md = clean_markdown(response.response)
-                                if needs_table_retry(page_md):
-                                    self.progress_queue.put(("log", "    -> Sửa cấu trúc bảng từ kết quả OCR bị vỡ.\n"))
-                                    response = self.client.generate(
-                                        model=resolve_qwen_model(self.model_name),
-                                        prompt=TABLE_STRUCTURE_REPAIR_PROMPT.format(broken_markdown=page_md),
-                                        images=[str(qwen_images[0])], think=False, stream=False,
-                                        options={"temperature": 0, "num_ctx": 12288, "num_predict": 6144}, keep_alive="10m",
-                                    )
-                                    page_md = clean_markdown(response.response)
-                            qwen_seconds = time.perf_counter() - qwen_started_at
+                        except PipelineCancelled:
+                            return None
+                        qwen_seconds = time.perf_counter() - qwen_started_at
                         
                         if extracted_paths:
                             self.progress_queue.put(("log", f"    -> Đã trích xuất {len(extracted_paths)} hình ảnh từ PDF trang {page_num}.\n"))
-                            page_md, unplaced_paths = link_extracted_images(page_md, extracted_paths)
-                            if unplaced_paths:
-                                fallback_images = "\n\n".join(
-                                    f"![Hình ảnh trang {page_num}]({path})" for path in unplaced_paths
-                                )
-                                page_md = f"{page_md.rstrip()}\n\n{fallback_images}"
+                        page_md = apply_page_assets(page_md, page_num, extracted_paths)
 
+                        from app.core.quality_gate import choose_best_page, evaluate_page
+                        quality = evaluate_page(page_md, self.output_dir)
+                        if quality.warnings:
+                            self.progress_queue.put(("log", f"    -> [Cảnh báo] Trang {page_num}: {', '.join(quality.warnings)}\n"))
+                        if not quality.passed:
+                            initial_md, initial_quality = page_md, quality
+                            self.progress_queue.put(("log", f"    -> Quality retry trang {page_num}: {', '.join(quality.errors)}\n"))
+                            try:
+                                retry_md = ocr_qwen_images(
+                                    self.client,
+                                    hybrid_model if is_hybrid else resolve_qwen_model(self.model_name),
+                                    [img_path],
+                                    has_table=has_table,
+                                    extra_instruction="\n\n" + QUALITY_RETRY_INSTRUCTION.format(errors=", ".join(quality.errors)),
+                                    log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
+                                    before_request=before_qwen_request,
+                                )
+                            except PipelineCancelled:
+                                return None
+                            except Exception as retry_error:
+                                page_md, quality = initial_md, initial_quality
+                                self.progress_queue.put(("log", f"    -> [Cảnh báo] Retry trang {page_num} bị lỗi; giữ kết quả ban đầu: {retry_error}\n"))
+                            else:
+                                retry_md = apply_page_assets(retry_md, page_num, extracted_paths)
+                                retry_quality = evaluate_page(retry_md, self.output_dir)
+                                if retry_quality.warnings:
+                                    self.progress_queue.put(("log", f"    -> [Cảnh báo] Retry trang {page_num}: {', '.join(retry_quality.warnings)}\n"))
+                                page_md, quality = choose_best_page(
+                                    initial_md, initial_quality, retry_md, retry_quality
+                                )
+                            if not quality.passed:
+                                self.progress_queue.put((
+                                    "log",
+                                    f"    -> [Cảnh báo] Trang {page_num} vẫn chưa đạt quality gate "
+                                    f"({', '.join(quality.errors)}); dùng kết quả tốt nhất và tiếp tục.\n",
+                                ))
+
+                        qwen_seconds = time.perf_counter() - qwen_started_at
                         elapsed = time.perf_counter() - started_at
                         self.progress_queue.put(("log", f"    Render: {render_timings[idx]:.1f}s | Paddle: {paddle_seconds:.1f}s | Qwen: {qwen_seconds:.1f}s\n"))
                         self.progress_queue.put(("log", f"    -> Hoàn thành Trang {page_num} ({elapsed:.1f} giây)\n"))
                         
+                        with self.progress_lock:
+                            self.pages_processed = getattr(self, "pages_processed", 0) + 1
+                            pages_done = self.pages_processed
+                            if pages_done % 5 == 0:
+                                import gc
+                                gc.collect()
+                                self.progress_queue.put(("log", f"    -> [Memory] Đã dọn rác RAM sau {pages_done} trang.\n"))
+                            
+                            elapsed_total = time.perf_counter() - pdf_start_time
+                            avg_time = elapsed_total / pages_done
+                            remaining_pages = total_pages - pages_done
+                            eta_seconds = avg_time * remaining_pages
+                            self.progress_queue.put(("stats_update", (avg_time, eta_seconds)))
+                        
+                        return (page_num, page_md)
+
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                        futures = []
+                        for idx, img_path in enumerate(page_images):
+                            future = executor.submit(process_page_worker, (idx, img_path))
+                            # Always stop the live timer, including cancellation and
+                            # exceptions raised by a failed quality gate.
+                            future.add_done_callback(
+                                lambda _future, page_num=idx + 1:
+                                self.progress_queue.put(("page_timer_end", page_num))
+                            )
+                            futures.append(future)
+                        
+                        results = []
+                        for future in concurrent.futures.as_completed(futures):
+                            res = future.result()
+                            if res is not None:
+                                results.append(res)
+                    
+                    results.sort(key=lambda x: x[0])
+                    from app.core.quality_gate import validate_page_numbers
+                    page_quality = validate_page_numbers([page_num for page_num, _ in results], total_pages)
+                    if not page_quality.passed and not self.stop_event.is_set():
+                        raise RuntimeError("Thiếu trang trước khi lưu: " + ", ".join(page_quality.errors))
+                    
+                    for page_num, page_md in results:
                         ocr_contents.append(f"<!-- Page {page_num} -->\n\n{page_md}")
                     
                     if self.stop_event.is_set():
@@ -546,27 +659,28 @@ class OCRWorker:
                     # Save results
                     final_md = "\n\n".join(ocr_contents) + "\n"
                     try:
-                        final_md = merge_markdown_tables(final_md)
-                    except Exception as merge_err:
-                        self.progress_queue.put(("log", f"    -> [Chú ý] Không thể gộp bảng: {merge_err}\n"))
-                    try:
-                        final_md = post_process_markdown(final_md)
+                        final_md = finalize_markdown(final_md)
                     except Exception as pp_err:
-                        self.progress_queue.put(("log", f"    -> [Chú ý] Không thể tối ưu hóa Markdown: {pp_err}\n"))
+                        self.progress_queue.put(("log", f"    -> [Chú ý] Không thể hoàn thiện Markdown: {pp_err}\n"))
                     temp_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
                     temp_output_path.write_text(final_md, encoding="utf-8")
                     os.replace(temp_output_path, output_path)
                     self.progress_queue.put(("log", f"  - Đã lưu kết quả tại: {output_path.name}\n"))
+                    file_elapsed = time.perf_counter() - pdf_start_time
+                    self.progress_queue.put(("log", f"  - Tổng thời gian OCR file: {format_elapsed(file_elapsed)}\n"))
             
             if self.stop_event.is_set():
-                self.progress_queue.put(("log", "\n[DỪNG] Tiến trình đã bị hủy bởi người dùng.\n"))
+                batch_elapsed = time.perf_counter() - batch_start_time
+                self.progress_queue.put(("log", f"\n[DỪNG] Tiến trình đã bị hủy bởi người dùng sau {format_elapsed(batch_elapsed)}.\n"))
                 self.progress_queue.put(("finished", "cancelled"))
             else:
-                self.progress_queue.put(("log", "\n[HOÀN THÀNH] Hoàn thành tất cả tài liệu!\n"))
+                batch_elapsed = time.perf_counter() - batch_start_time
+                self.progress_queue.put(("log", f"\n[HOÀN THÀNH] Tổng thời gian OCR: {format_elapsed(batch_elapsed)}.\n"))
                 self.progress_queue.put(("finished", "completed"))
 
         except Exception as e:
-            self.progress_queue.put(("log", f"\n[LỖI] Có lỗi xảy ra: {str(e)}\n"))
+            batch_elapsed = time.perf_counter() - batch_start_time
+            self.progress_queue.put(("log", f"\n[LỖI] Có lỗi xảy ra sau {format_elapsed(batch_elapsed)}: {str(e)}\n"))
             self.progress_queue.put(("finished", f"error: {str(e)}"))
 
 class AppGUI:
@@ -578,6 +692,11 @@ class AppGUI:
         
         self.progress_queue = queue.Queue()
         self.stop_event = threading.Event()
+        self.resume_event = threading.Event()
+        self.resume_event.set()
+        self.is_paused = False
+        self._is_running = False
+        self.active_page_timers = {}
         self.worker_thread = None
         self._preview_images: list[ImageTk.PhotoImage] = []
         self.latest_overlay_path: Path | None = None
@@ -676,7 +795,12 @@ class AppGUI:
             state="readonly",
             font=("Segoe UI", 10),
         )
-        self.model_combobox.pack(fill=tk.X, expand=True)
+        self.model_combobox.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
+
+        ttk.Label(model_frame, text="Luồng:").pack(side=tk.LEFT, padx=(5, 2))
+        self.workers_var = tk.IntVar(value=1)
+        workers_spin = ttk.Spinbox(model_frame, from_=1, to=2, textvariable=self.workers_var, width=5, font=("Segoe UI", 10))
+        workers_spin.pack(side=tk.LEFT)
 
         # 4. Status & Progress Indicators
         progress_frame = ttk.LabelFrame(main_frame, text=" Tiến trình ", padding=10)
@@ -696,17 +820,37 @@ class AppGUI:
         self.page_progressbar = ttk.Progressbar(progress_frame, mode="determinate")
         self.page_progressbar.pack(fill=tk.X, pady=(2, 5))
 
+        # Thống kê tổng hợp (Summary Dashboard)
+        stats_frame = ttk.LabelFrame(main_frame, text=" Thống kê tổng hợp ", padding=10)
+        stats_frame.pack(fill=tk.X, pady=(0, 8))
+        
+        self.stats_avg_var = tk.StringVar(value="Trung bình: -- s/trang")
+        ttk.Label(stats_frame, textvariable=self.stats_avg_var).pack(side=tk.LEFT, expand=True)
+        
+        self.stats_eta_var = tk.StringVar(value="ETA: Đang tính toán...")
+        ttk.Label(stats_frame, textvariable=self.stats_eta_var).pack(side=tk.LEFT, expand=True)
+
+        self.stats_active_var = tk.StringVar(value="Đang OCR: --")
+        ttk.Label(stats_frame, textvariable=self.stats_active_var).pack(side=tk.LEFT, expand=True)
+        
+        self.stats_warn_var = tk.StringVar(value="Cảnh báo: 0")
+        ttk.Label(stats_frame, textvariable=self.stats_warn_var, foreground="red").pack(side=tk.LEFT, expand=True)
+
         # 5. Action Buttons (Start/Stop)
         action_frame = ttk.Frame(main_frame)
         action_frame.pack(fill=tk.X, pady=(0, 8))
-        action_frame.columnconfigure(0, weight=3)
+        action_frame.columnconfigure(0, weight=2)
         action_frame.columnconfigure(1, weight=1)
+        action_frame.columnconfigure(2, weight=1)
         
         self.btn_start = ttk.Button(action_frame, text="Bắt đầu OCR", style="Start.TButton", command=self.start_ocr)
         self.btn_start.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         
+        self.btn_pause = ttk.Button(action_frame, text="Tạm dừng", style="Action.TButton", command=self.toggle_pause, state=tk.DISABLED)
+        self.btn_pause.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        
         self.btn_stop = ttk.Button(action_frame, text="Dừng lại", style="Stop.TButton", command=self.stop_ocr, state=tk.DISABLED)
-        self.btn_stop.grid(row=0, column=1, sticky="ew")
+        self.btn_stop.grid(row=0, column=2, sticky="ew")
 
         self.btn_preview = ttk.Button(
             action_frame, text="Xem trước Markdown...", style="Action.TButton", command=self.choose_preview
@@ -716,7 +860,8 @@ class AppGUI:
             action_frame, text="Xem overlay layout", style="Action.TButton",
             command=self.show_latest_layout, state=tk.DISABLED,
         )
-        self.btn_layout_preview.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        self.btn_layout_preview.grid(row=1, column=1, columnspan=2, sticky="ew", pady=(6, 0))
+
 
         # Live diagnostic preview: placed below controls so Start/Stop remain
         # visible even on smaller displays.
@@ -933,6 +1078,12 @@ class AppGUI:
             
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
+        self.btn_pause.configure(state=tk.NORMAL, text="Tạm dừng")
+        self._is_running = True
+        self.is_paused = False
+        self.resume_event.set()
+        self.active_page_timers = {}
+        self.stats_active_var.set("Đang OCR: đang chuẩn bị...")
         
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert(tk.END, "Đang khởi tạo...\n")
@@ -945,12 +1096,28 @@ class AppGUI:
         resolved_model = resolve_qwen_model(model_name)
         if resolved_model != model_name:
             self.log_text.insert(tk.END, f"Dùng Ollama model: {resolved_model}\n")
-        worker = OCRWorker(target_path, Path(output), self.progress_queue, self.stop_event, model_name)
+        worker = OCRWorker(target_path, Path(output), self.progress_queue, self.stop_event, self.resume_event, model_name, workers=self.workers_var.get() if hasattr(self, 'workers_var') else 1)
         self.worker_thread = threading.Thread(target=worker.run, daemon=True)
         self.worker_thread.start()
 
+
+    def toggle_pause(self):
+        if not self._is_running: return
+        self.is_paused = not self.is_paused
+        if self.is_paused:
+            self.resume_event.clear()
+            self.btn_pause.configure(text="Tiếp tục")
+            self.progress_queue.put(("log", "\n[TẠM DỪNG] Tiến trình đang tạm dừng...\n"))
+        else:
+            self.resume_event.set()
+            self.btn_pause.configure(text="Tạm dừng")
+            self.progress_queue.put(("log", "\n[TIẾP TỤC] Tiến trình tiếp tục chạy...\n"))
+
     def stop_ocr(self):
         self.stop_event.set()
+        # Release workers blocked at resume_event.wait() so they can observe the
+        # stop flag and exit even when Stop is pressed while paused.
+        self.resume_event.set()
         self.log_text.insert(tk.END, "\nĐang yêu cầu dừng tiến trình... Vui lòng đợi.\n")
         self.log_text.see(tk.END)
         self.btn_stop.configure(state=tk.DISABLED)
@@ -967,8 +1134,21 @@ class AppGUI:
             try:
                 msg_type, data = self.progress_queue.get_nowait()
                 if msg_type == "log":
+                    if any(marker in data for marker in ("[Chú ý]", "[Cảnh báo]", "[Warning]", "[LỖI]")):
+                        self.warning_count = getattr(self, "warning_count", 0) + 1
+                        if hasattr(self, "stats_warn_var"):
+                            self.stats_warn_var.set(f"Cảnh báo: {self.warning_count}")
                     self.log_text.insert(tk.END, data)
                     self.log_text.see(tk.END)
+                elif msg_type == "stats_update":
+                    avg_time, eta_seconds = data
+                    if hasattr(self, "stats_avg_var"):
+                        self.stats_avg_var.set(f"Trung bình: {avg_time:.1f} s/trang")
+                        if eta_seconds > 0:
+                            m, s = divmod(int(eta_seconds), 60)
+                            self.stats_eta_var.set(f"ETA: ~{m} phút {s} giây")
+                        else:
+                            self.stats_eta_var.set("ETA: Sắp xong")
                 elif msg_type == "file_progress":
                     curr, total, name = data
                     self.file_progress_var.set(f"File {curr}/{total}: {name}")
@@ -979,6 +1159,14 @@ class AppGUI:
                     self.page_progress_var.set(f"Trang {curr}/{total}")
                     percent = (curr / total) * 100
                     self.page_progressbar["value"] = percent
+                elif msg_type == "page_timer_start":
+                    page_num, started_at = data
+                    if not hasattr(self, "active_page_timers"):
+                        self.active_page_timers = {}
+                    self.active_page_timers[page_num] = started_at
+                elif msg_type == "page_timer_end":
+                    if hasattr(self, "active_page_timers"):
+                        self.active_page_timers.pop(data, None)
                 elif msg_type == "layout_overlay":
                     self.latest_overlay_path = Path(data)
                     self.btn_layout_preview.configure(state=tk.NORMAL)
@@ -986,8 +1174,16 @@ class AppGUI:
                 elif msg_type == "finished":
                     self.btn_start.configure(state=tk.NORMAL)
                     self.btn_stop.configure(state=tk.DISABLED)
-                    self.file_progressbar["value"] = 0
-                    self.page_progressbar["value"] = 0
+                    self.btn_pause.configure(state=tk.DISABLED)
+                    self._is_running = False
+                    self.active_page_timers = {}
+                    self.stats_active_var.set("Đang OCR: --")
+                    if data == "completed":
+                        self.file_progressbar["value"] = 100
+                        self.page_progressbar["value"] = 100
+                    else:
+                        self.file_progressbar["value"] = 0
+                        self.page_progressbar["value"] = 0
                     self.file_progress_var.set("File: Xong")
                     self.page_progress_var.set("Trang: Xong")
                     
@@ -999,6 +1195,16 @@ class AppGUI:
                         messagebox.showerror("Lỗi", f"Quá trình chạy gặp lỗi:\n{data}")
             except Exception:
                 pass
+        active_timers = getattr(self, "active_page_timers", {})
+        if active_timers and self._is_running:
+            now = time.perf_counter()
+            running = " | ".join(
+                f"Trang {page_num}: {now - started_at:.1f}s"
+                for page_num, started_at in sorted(active_timers.items())
+            )
+            self.stats_active_var.set(f"Đang OCR: {running}")
+        elif hasattr(self, "stats_active_var") and self._is_running:
+            self.stats_active_var.set("Đang OCR: đang chuẩn bị...")
         self.root.after(100, self.poll_queue)
 
 def main():

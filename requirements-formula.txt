@@ -1,0 +1,4 @@
+# Optional specialized LaTeX formula recognition.
+# Install after the base runtime requirements:
+#   pip install -r requirements-formula.txt
+pix2tex>=0.1.4

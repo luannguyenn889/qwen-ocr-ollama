@@ -1,3 +1,8 @@
+"""
+Module: ocr_single.py
+Nhiệm vụ: Chạy nhận diện OCR cho một tệp hình ảnh đơn lẻ sử dụng mô hình Qwen qua Ollama Client.
+"""
+
 import sys
 from pathlib import Path
 from time import perf_counter
@@ -13,7 +18,9 @@ Do not summarize.
 Return Markdown only.
 """.strip()
 
+# Hàm main điều khiển tiến trình nhận diện hình ảnh đơn
 def main():
+    """Đọc ảnh test.png, gửi yêu cầu tới mô hình Qwen qua Ollama và ghi kết quả vào test.md."""
     image_path = Path("test.png").resolve()
     output_path = Path("test.md").resolve()
 
@@ -42,7 +49,7 @@ def main():
 
     raw_text = response.response.strip()
 
-    # Clean potential markdown block wrapper
+    # Làm sạch các rào chắn Markdown nếu có
     clean_text = raw_text
     if clean_text.startswith("```markdown"):
         clean_text = clean_text[len("```markdown"):]
@@ -58,3 +65,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

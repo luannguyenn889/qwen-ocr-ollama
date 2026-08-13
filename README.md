@@ -24,10 +24,55 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
    * PaddleOCR 3.x chỉ phát hiện khung chữ/cột và vùng bảng bằng toạ độ; không có `rec_texts` nào được đưa vào Markdown hay prompt.
    * Với trang nhiều cột, ảnh được cắt từ trái sang phải trước khi Qwen đọc. Nếu bước layout lỗi, hệ thống tự quay về gửi nguyên trang cho Qwen.
    * Có thể tắt để đo hiệu năng hoặc quay về luồng cũ: đặt `ENABLE_LAYOUT_DETECTION = False` trong `app/core/batch_ocr.py`.
+6. **Báo cáo hiệu năng chi tiết (Benchmark JSON Export)**:
+   * Tự động xuất file báo cáo hiệu năng dạng JSON (`[tên_file]_benchmark.json`) nằm cùng thư mục đầu ra ngay sau khi quy trình hoàn tất.
+   * Ghi nhận đầy đủ tổng thời gian, tốc độ trung bình, số worker và tên model thực thi.
+   * Phân tách rành mạch thời gian trích xuất ảnh PDF (render), thời gian phân tích bố cục (PaddleOCR) và thời gian nhận diện AI (Qwen) cho từng trang.
 
 ---
 
-## I. Hai cách thiết lập dịch vụ Ollama (Ollama Server)
+## II. Luồng xử lý chính (Core Pipeline)
+
+Hệ thống xử lý từng file PDF qua luồng đa bước (pipeline) tự động để đảm bảo cấu trúc, bảng biểu, công thức toán và hình ảnh được giữ nguyên vẹn nhất:
+
+```mermaid
+graph TD
+    A[Input: Tệp PDF] --> B[1. Trích xuất ảnh PDF]
+    B --> C{2. Phân tích Bố cục<br/>PaddleOCR}
+    C -->|Có Bảng| D[Render nét 300 DPI]
+    C -->|Có Cột| E[Cắt từng cột riêng biệt]
+    C -->|Bình thường| F[Trang ảnh mặc định]
+    D --> G
+    E --> G
+    F --> G
+    G[3. Trích xuất Hình ảnh & Công thức Toán]
+    G --> H[4. Nhận diện OCR bằng AI<br/>Qwen VLM]
+    H --> I{Kiểm tra Bảng bị vỡ?}
+    I -->|Có lỗi| J[5. Retry: Bắt buộc dùng HTML Table]
+    I -->|Hợp lệ| K[6. Lắp ráp & Hoàn thiện]
+    J --> K
+    K --> L[Nối bảng bị đứt giữa 2 trang]
+    L --> M[7. Xuất Kết quả<br/>Markdown & Benchmark JSON]
+```
+
+1. **Trích xuất ảnh (Render):** Chuyển đổi các trang PDF thành ảnh PNG thông qua `PyMuPDF`.
+2. **Phân tích bố cục (Layout Detection):** Dùng `PaddleOCR` (tuỳ chọn) quét toạ độ cột văn bản, bảng biểu và hình vẽ.
+   - *Nếu có bảng:* Tự động render lại trang với độ phân giải siêu nét (300 DPI) để chống vỡ chữ.
+   - *Nếu chia cột:* Tự động cắt riêng từng cột và đọc tuần tự từ trái qua phải.
+3. **Trích xuất Hình ảnh & Toán học:** 
+   - Hình vẽ, sơ đồ trên trang được cắt và lưu thành file thật vào thư mục `images/`.
+   - Vùng công thức toán học được trích xuất riêng biệt bằng `LaTeX-OCR` để lấy mã LaTeX chuẩn.
+4. **Nhận diện bằng AI (Vision VLM OCR):** Gửi ảnh qua mô hình `Qwen` (Ollama) kèm theo hướng dẫn prompt nghiêm ngặt. Các hình vẽ và công thức được Qwen đặt "placeholder" (giữ chỗ).
+5. **Cơ chế tự sửa lỗi (Self-Correction):** Nếu phát hiện Qwen xuất bảng bị vỡ hoặc sai định dạng Markdown, hệ thống tự động bắt AI chạy lại (Retry) với hướng dẫn sửa lỗi cấu trúc bảng HTML.
+6. **Lắp ráp & Hoàn thiện (Post-processing):** 
+   - Thay thế placeholder bằng mã LaTeX gốc và đường dẫn hình ảnh vật lý.
+   - Khi layout có đủ tọa độ, OCR riêng block tiêu đề/văn bản/bảng và chèn block ảnh trực tiếp theo reading order; placeholder chỉ còn là fallback.
+   - Gộp các trang lại và kích hoạt **Smart Table Merger** để nối các bảng bị ngắt quãng giữa 2 trang.
+7. **Xuất kết quả & Báo cáo:** Lưu file `.md` cuối cùng và sinh file `.json` đo lường benchmark (hiệu suất thời gian chi tiết từng bước).
+
+---
+
+## III. Hai cách thiết lập dịch vụ Ollama (Ollama Server)
 
 Để phục vụ OCR, bạn cần có một Ollama Server chạy model `qwen3.5:4b`. Dự án hỗ trợ 2 cách thiết lập sau (chọn 1 trong 2 cách):
 
@@ -57,7 +102,7 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
 
 ---
 
-## II. Các bước thiết lập môi trường Python chạy Code (Client)
+## IV. Các bước thiết lập môi trường Python chạy Code (Client)
 
 Dù bạn chọn cách chạy Ollama nào ở trên (Cách 1 hay Cách 2), bạn vẫn cần cấu hình môi trường Python trên máy thật để chạy mã nguồn dự án:
 
@@ -89,9 +134,32 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Nhận diện công thức chuyên biệt bằng LaTeX-OCR là tính năng tùy chọn. Cài thêm khi cần:
+
+```bash
+pip install -r requirements-formula.txt
+```
+
+Nếu `pix2tex` hoặc model của nó không khả dụng, CLI/GUI sẽ thông báo rõ và tiếp tục dùng Qwen để nhận diện công thức; tác vụ OCR không bị dừng.
+
+### Cấu hình Layout Detection offline
+
+Paddle layout mặc định bỏ qua kiểm tra kết nối tới các model hoster. Có thể cấu hình thêm bằng biến môi trường:
+
+```powershell
+# Tắt hoàn toàn layout detection và luôn OCR nguyên trang
+$env:QWEN_OCR_DISABLE_LAYOUT="1"
+
+# Hoặc chỉ định model local rõ ràng
+$env:QWEN_OCR_TEXT_DETECTION_MODEL_DIR="D:\models\text_detection"
+$env:QWEN_OCR_LAYOUT_MODEL_DIR="D:\models\layout_detection"
+```
+
+CLI và GUI sẽ ghi rõ `layout enabled` hoặc `layout disabled` vào log khi bắt đầu xử lý.
+
 ---
 
-## III. Hướng dẫn sử dụng các công cụ chính
+## V. Hướng dẫn sử dụng các công cụ chính
 
 Các script nghiệp vụ chính đã được tổ chức lại trong thư mục `app/` và có các file chuyển tiếp (wrappers) ở thư mục gốc để thuận tiện gọi lệnh:
 
@@ -115,7 +183,7 @@ python ocr_validator.py
 
 ---
 
-## IV. Cấu trúc thư mục dự án
+## VI. Cấu trúc thư mục dự án
 
 ```text
 qwen-ocr-ollama/

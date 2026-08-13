@@ -1,5 +1,5 @@
 """
-Module: pdf_ocr
+Module: pdf_ocr.py
 Nhiệm vụ: Phối hợp quá trình nhận diện toàn bộ tài liệu PDF (OCR PDF).
 Quy trình:
   1. Dùng text layer có sẵn của PDF khi đủ tin cậy.
@@ -25,6 +25,7 @@ from app.core.pdf_rerender import (
 from app.core.pdf_text_layer import extract_native_text
 
 
+# Hàm chính điều phối quá trình xử lý OCR cho toàn bộ file PDF
 def ocr_pdf(
     engine: OllamaQwenEngine,
     pdf_path: str | Path,
@@ -36,6 +37,7 @@ def ocr_pdf(
     - Nhận vào đối tượng engine, đường dẫn tệp PDF và thư mục lưu kết quả.
     - Lưu kết quả ra file markdown (.md) trùng tên với file PDF tại output_dir.
     """
+    # Chuyển đổi và chuẩn hóa đường dẫn đầu vào
     pdf_path = Path(
         pdf_path
     ).resolve()
@@ -45,6 +47,7 @@ def ocr_pdf(
             f"Không tìm thấy file PDF đầu vào: {pdf_path}"
         )
 
+    # Đảm bảo thư mục đầu ra tồn tại
     output_dir = Path(
         output_dir
     ).resolve()
@@ -54,6 +57,7 @@ def ocr_pdf(
         exist_ok=True,
     )
 
+    # Xác định đường dẫn file đích và file tạm
     final_path = (
         output_dir
         / f"{pdf_path.stem}.md"
@@ -66,6 +70,8 @@ def ocr_pdf(
 
     print(f"[1/3] PDF đầu vào: {pdf_path}", flush=True)
     print(f"      Kích thước: {pdf_path.stat().st_size:,} bytes", flush=True)
+    
+    # Phân loại trang: trang nào có text sẵn, trang nào cần OCR
     native_pages: dict[int, str] = {}
     ocr_page_numbers: set[int] = set()
     document = pymupdf.open(pdf_path)
@@ -84,12 +90,16 @@ def ocr_pdf(
         f"[2/3] Text layer: {len(native_pages)} trang; OCR fallback: {len(ocr_page_numbers)} trang.",
         flush=True,
     )
+    
+    # Kiểm tra kết nối engine trước khi thực hiện OCR các trang cần thiết
     if ocr_page_numbers:
         print("      Đang kiểm tra kết nối Ollama...", flush=True)
         engine.check_connection()
+        
     print(f"[3/3] Đang xuất Markdown (OCR fallback DPI={dpi})...", flush=True)
     document_started_at = perf_counter()
 
+    # Sử dụng thư mục tạm để lưu ảnh render trước khi OCR
     with tempfile.TemporaryDirectory() as temp_images:
 
         with temp_path.open(
@@ -97,9 +107,12 @@ def ocr_pdf(
             encoding="utf-8",
         ) as output_file:
 
+            # Render các trang cần OCR thành ảnh
             rendered_pages = dict(render_pdf(
                 pdf_path, temp_images, dpi=dpi, page_numbers=ocr_page_numbers,
             ))
+            
+            # Duyệt qua từng trang để ghép nội dung từ text layer hoặc OCR
             for page_number in range(1, len(native_pages) + len(ocr_page_numbers) + 1):
                 if page_number in native_pages:
                     markdown = native_pages[page_number]
@@ -114,6 +127,7 @@ def ocr_pdf(
                     source = "ocr"
                     print(f"[Trang {page_number}] Hoàn tất OCR trong {page_elapsed:.1f} giây.", flush=True)
 
+                # Ghi chú nguồn gốc nội dung trang
                 output_file.write(
                     f"\n\n<!-- Trang {page_number}; nguồn: {source} -->\n\n"
                 )
@@ -126,6 +140,7 @@ def ocr_pdf(
                     "\n"
                 )
 
+    # Hoàn tất: đổi tên file tạm thành file chính thức
     os.replace(
         temp_path,
         final_path,

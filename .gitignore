@@ -14,9 +14,11 @@ logs/
 output/
 OCR/
 PDF/
+OCR_output/
 test_hybrid_out/
 scratch_images/
 page_*.png
+test.*
 *.log
 
 # Environment variables / secrets
