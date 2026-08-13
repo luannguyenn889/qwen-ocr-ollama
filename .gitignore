@@ -16,6 +16,7 @@ OCR/
 PDF/
 OCR_output/
 test_hybrid_out/
+test_output/
 scratch_images/
 .cache/
 page_*.png
