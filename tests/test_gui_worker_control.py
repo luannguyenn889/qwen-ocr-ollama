@@ -33,6 +33,12 @@ class GuiWorkerControlTests(unittest.TestCase):
         )
         self.assertEqual(worker.workers, 2)
 
+    def test_hybrid_label_resolves_to_qwen_model(self):
+        self.assertEqual(
+            batch_ocr.resolve_qwen_model("Hybrid (Paddle layout + qwen3.5:4b)"),
+            batch_ocr.MODEL,
+        )
+
     def test_stop_releases_paused_workers(self):
         app = AppGUI.__new__(AppGUI)
         app.stop_event = threading.Event()

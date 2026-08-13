@@ -92,6 +92,19 @@ class QualityGateTests(unittest.TestCase):
         )
         self.assertEqual("a more complete retry", chosen)
 
+    def test_best_page_uses_error_severity_not_raw_count(self):
+        chosen, _ = choose_best_page(
+            "retry with two minor issues",
+            QualityReport(("glued_words", "unbalanced_math_delimiters")),
+            "original with severe issue",
+            QualityReport(("empty_page",)),
+        )
+        self.assertEqual("retry with two minor issues", chosen)
+
+    def test_long_identifier_is_not_a_glued_word(self):
+        report = evaluate_page("CustomerAccountTransactionReferenceIdentifier", ".")
+        self.assertNotIn("glued_words", report.errors)
+
 
 if __name__ == "__main__":
     unittest.main()

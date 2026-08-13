@@ -23,6 +23,18 @@ ENGLISH_WORDS = {
     "the", "and", "is", "are", "of", "to", "in", "for", "with", "from",
     "this", "that", "was", "were", "by", "on", "as", "an", "be", "or",
 }
+ERROR_WEIGHTS = {
+    "empty_page": 100,
+    "missing_pages": 100,
+    "duplicate_pages": 80,
+    "missing_image": 40,
+    "unresolved_placeholder": 35,
+    "malformed_markdown_table": 25,
+    "malformed_html_table": 25,
+    "unbalanced_math_delimiters": 15,
+    "missing_vietnamese_diacritics": 10,
+    "glued_words": 5,
+}
 
 
 @dataclass(frozen=True)
@@ -66,10 +78,11 @@ def _prose_paragraphs(markdown: str) -> list[str]:
     return paragraphs
 
 
-def _vietnamese_diacritic_confidence(markdown: str) -> tuple[int, int]:
+def _vietnamese_diacritic_confidence(markdown: str) -> tuple[int, int, int]:
     """Return counts of high- and medium-confidence paragraphs missing accents."""
     high = medium = 0
-    for paragraph in _prose_paragraphs(markdown):
+    paragraphs = _prose_paragraphs(markdown)
+    for paragraph in paragraphs:
         lower = paragraph.casefold()
         words = re.findall(r"[a-zA-ZÀ-ỹĐđ]+", lower)
         if len(words) < 12:
@@ -98,9 +111,22 @@ def _vietnamese_diacritic_confidence(markdown: str) -> tuple[int, int]:
 
         if score >= 7:
             high += 1
-        elif score >= 5:
+        elif score >= 6:
             medium += 1
-    return high, medium
+    return high, medium, len(paragraphs)
+
+
+def _error_weight(error: str) -> int:
+    kind = error.partition(":")[0]
+    return ERROR_WEIGHTS.get(kind, 20)
+
+
+def _quality_key(markdown: str, report: QualityReport) -> tuple[int, int, int, int]:
+    severe = sum(_error_weight(error) >= 35 for error in report.errors)
+    score = sum(_error_weight(error) for error in report.errors)
+    warning_score = len(report.warnings)
+    content_length = len("".join(markdown.split()))
+    return severe, score, warning_score, -content_length
 
 
 def choose_best_page(
@@ -111,11 +137,11 @@ def choose_best_page(
 ) -> tuple[str, QualityReport]:
     """Return the strongest available OCR result after a quality retry.
 
-    Fewer deterministic quality errors wins.  When both versions have the same
-    number of errors, prefer the version containing more non-whitespace text.
+    Severe failures and weighted error cost take precedence over raw error
+    count. Warnings and content length are deterministic tie-breakers.
     """
-    first_key = (len(first_report.errors), -len("".join(first_markdown.split())))
-    retry_key = (len(retry_report.errors), -len("".join(retry_markdown.split())))
+    first_key = _quality_key(first_markdown, first_report)
+    retry_key = _quality_key(retry_markdown, retry_report)
     if retry_key < first_key:
         return retry_markdown, retry_report
     return first_markdown, first_report
@@ -156,13 +182,19 @@ def evaluate_page(markdown: str, output_dir: str | Path) -> QualityReport:
     # words that lost their spaces.
     visible_text = MARKDOWN_LINK_RE.sub(r"\1", markdown)
     visible_text = re.sub(r"https?://\S+", "", visible_text, flags=re.IGNORECASE)
-    if re.search(r"\b\w{45,}\b", visible_text, re.UNICODE):
+    glued_candidates = re.findall(r"(?<![\w_-])[^\W\d_]{45,}(?![\w_-])", visible_text, re.UNICODE)
+    glued_signals = ("cua", "va", "la", "trong", "duoc", "nhung", "mot", "cho", "voi", "viet", "nam")
+    if any(
+        token == token.casefold()
+        and (len(token) >= 80 or sum(signal in token.casefold() for signal in glued_signals) >= 3)
+        for token in glued_candidates
+    ):
         errors.append("glued_words")
 
-    high_confidence, medium_confidence = _vietnamese_diacritic_confidence(markdown)
+    high_confidence, medium_confidence, prose_count = _vietnamese_diacritic_confidence(markdown)
     if high_confidence:
         errors.append("missing_vietnamese_diacritics")
-    elif medium_confidence:
+    elif medium_confidence >= 2 and medium_confidence / max(prose_count, 1) >= 0.25:
         warnings.append("suspected_missing_vietnamese_diacritics")
 
     if len(re.findall(r"(?<!\\)\$", markdown)) % 2:

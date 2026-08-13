@@ -155,20 +155,10 @@ VIETNAMESE_DIACRITICS = set("ăâđêôơưáàảãạấầẩẫậắằẳ�
 
 # Hàm phát hiện các trang nhận diện bị lỗi mất dấu tiếng Việt hoặc dính chữ
 def needs_vision_retry(markdown: str) -> bool:
-    """Phát hiện các lỗi nhận diện lai phổ biến: đoạn văn bị dính chữ hoặc tiếng Việt bị mất dấu phụ."""
-    if re.search(r"\b\w{45,}\b", markdown, re.UNICODE):
-        gc.collect()
-    return True
-    letters = [char for char in markdown.casefold() if char.isalpha()]
-    if len(letters) < 150:
-        return False
-    lower = markdown.casefold()
-    signals = sum(lower.count(word) for word in (" viet ", " nam ", " cua ", " va ", " la ", " nhung ", " chuong ", " trong "))
-    signals += sum(lower.count(word) for word in (" việt ", " của ", " và ", " là ", " những ", " chương "))
-    if signals < 3:
-        return False
-    accent_ratio = sum(char in VIETNAMESE_DIACRITICS for char in letters) / len(letters)
-    return accent_ratio < 0.04
+    """Request vision retry only for high-confidence quality failures."""
+    from app.core.quality_gate import evaluate_page
+    retry_errors = {"glued_words", "missing_vietnamese_diacritics"}
+    return any(error.partition(":")[0] in retry_errors for error in evaluate_page(markdown, ".").errors)
 
 
 # Hàm phát hiện xem cấu trúc bảng có bị vỡ thành văn bản thường hoặc danh sách không
@@ -541,11 +531,20 @@ def _is_markdown_separator(cells: list[str]) -> bool:
 
 def _malformed_table_to_html(rows: list[list[str]]) -> str:
     """Preserve every OCR cell in valid HTML when Markdown columns disagree."""
+    import html
+
+    def escape_cell(cell: str) -> str:
+        # Preserve explicit line breaks while escaping OCR text that could form
+        # unintended HTML tags or entities.
+        marker = "__QWEN_OCR_BR__"
+        protected = re.sub(r"<br\s*/?>", marker, cell, flags=re.IGNORECASE)
+        return html.escape(protected, quote=False).replace(marker, "<br>")
+
     output = ["<table>"]
     for row_index, cells in enumerate(rows):
         tag = "th" if row_index == 0 else "td"
         output.append("  <tr>")
-        output.extend(f"    <{tag}>{cell}</{tag}>" for cell in cells)
+        output.extend(f"    <{tag}>{escape_cell(cell)}</{tag}>" for cell in cells)
         output.append("  </tr>")
     output.append("</table>")
     return "\n".join(output)

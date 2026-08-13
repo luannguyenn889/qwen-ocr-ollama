@@ -7,36 +7,11 @@ Quy trình:
   3. Hiển thị tiến trình chi tiết của file, số trang hiện tại kèm thanh tiến trình ASCII và nhật ký (Log) thời gian thực.
 """
 
-import sys
 import os
 import threading
 import queue
 import tempfile
 import time
-import time
-import gc
-
-def generate_with_retry(client, kwargs, progress_queue, max_retries=3, log_prefix=""):
-    last_err: Exception | None = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            return client.generate(**kwargs)
-        except Exception as error:
-            last_err = error
-            progress_queue.put(
-                ("log", f"{log_prefix} [Chú ý] Lỗi Ollama "
-                        f"(lần thử {attempt}/{max_retries}): {error}\n")
-            )
-            if attempt < max_retries:
-                time.sleep(2)
-                gc.collect()
-
-    if last_err is not None:
-        raise last_err
-
-    raise RuntimeError("Không thể gọi Ollama: không có lần thử nào được thực hiện")
-
 import re
 from pathlib import Path
 # pyrefly: ignore [missing-import]
@@ -756,7 +731,7 @@ class AppGUI:
         btn_out.pack(side=tk.LEFT)
 
         # 3. Model Selection
-        model_frame = ttk.LabelFrame(main_frame, text=" Chọn mô hình OCR ", padding=10)
+        model_frame = ttk.LabelFrame(main_frame, text=" Mô hình Qwen Vision (Paddle tự phân tích layout) ", padding=10)
         model_frame.pack(fill=tk.X, pady=(0, 8))
 
         models_list = []
@@ -777,8 +752,7 @@ class AppGUI:
 
         default_models = [
             MODEL,
-            "Hybrid (PaddleOCR + qwen3.5:4b)",
-            "PaddleOCR (PP-OCRv6)",
+            "Hybrid (Paddle layout + qwen3.5:4b)",
             "qwen2.5-vl:7b",
             "qwen2.5-vl:3b",
             "qwen2.5vl:7b",

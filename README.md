@@ -13,7 +13,7 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
    * Tự động phát hiện và gộp các bảng Markdown bị phân cắt qua ranh giới trang (ví dụ bảng kéo dài từ trang trước sang trang sau).
    * Loại bỏ các dòng tiêu đề trùng lặp và khoảng trắng thừa, hợp nhất dữ liệu thành một bảng lớn duy nhất chuẩn Markdown.
 3. **Độ phân giải & Tăng cường hình ảnh**:
-   * Chuyển đổi PDF sang ảnh chất lượng cao chuẩn **300 DPI**.
+   * Render trang thường ở **150 DPI (CLI)** hoặc **200 DPI (GUI)**; trang có bảng được render lại ở **300 DPI**.
    * Tiền xử lý tăng cường độ tương phản (Contrast Enhancement) giúp làm sắc nét nét chữ, tăng độ chính xác nhận dạng đối với các ký tự toán học nhỏ.
 4. **Giao diện GUI chuyên nghiệp (Tkinter)**:
    * **Bất đồng bộ hoàn toàn (Multi-threading)**: Chạy tiến trình OCR trên luồng riêng biệt, không gây treo ứng dụng.
@@ -24,10 +24,9 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
    * PaddleOCR 3.x chỉ phát hiện khung chữ/cột và vùng bảng bằng toạ độ; không có `rec_texts` nào được đưa vào Markdown hay prompt.
    * Với trang nhiều cột, ảnh được cắt từ trái sang phải trước khi Qwen đọc. Nếu bước layout lỗi, hệ thống tự quay về gửi nguyên trang cho Qwen.
    * Có thể tắt để đo hiệu năng hoặc quay về luồng cũ: đặt `ENABLE_LAYOUT_DETECTION = False` trong `app/core/batch_ocr.py`.
-6. **Báo cáo hiệu năng chi tiết (Benchmark JSON Export)**:
-   * Tự động xuất file báo cáo hiệu năng dạng JSON (`[tên_file]_benchmark.json`) nằm cùng thư mục đầu ra ngay sau khi quy trình hoàn tất.
-   * Ghi nhận đầy đủ tổng thời gian, tốc độ trung bình, số worker và tên model thực thi.
-   * Phân tách rành mạch thời gian trích xuất ảnh PDF (render), thời gian phân tích bố cục (PaddleOCR) và thời gian nhận diện AI (Qwen) cho từng trang.
+6. **Theo dõi hiệu năng trong log**:
+   * Hiển thị thời gian render, phân tích Paddle và Qwen theo từng trang.
+   * GUI ghi tổng thời gian từng file và toàn bộ đợt OCR khi hoàn tất.
 
 ---
 
@@ -52,7 +51,7 @@ graph TD
     I -->|Hợp lệ| K[6. Lắp ráp & Hoàn thiện]
     J --> K
     K --> L[Nối bảng bị đứt giữa 2 trang]
-    L --> M[7. Xuất Kết quả<br/>Markdown & Benchmark JSON]
+    L --> M[7. Xuất Kết quả<br/>Markdown]
 ```
 
 1. **Trích xuất ảnh (Render):** Chuyển đổi các trang PDF thành ảnh PNG thông qua `PyMuPDF`.
@@ -68,7 +67,7 @@ graph TD
    - Thay thế placeholder bằng mã LaTeX gốc và đường dẫn hình ảnh vật lý.
    - Khi layout có đủ tọa độ, OCR riêng block tiêu đề/văn bản/bảng và chèn block ảnh trực tiếp theo reading order; placeholder chỉ còn là fallback.
    - Gộp các trang lại và kích hoạt **Smart Table Merger** để nối các bảng bị ngắt quãng giữa 2 trang.
-7. **Xuất kết quả & Báo cáo:** Lưu file `.md` cuối cùng và sinh file `.json` đo lường benchmark (hiệu suất thời gian chi tiết từng bước).
+7. **Xuất kết quả:** Lưu file `.md` cuối cùng; thời gian chi tiết được ghi trong log chạy.
 
 ---
 
@@ -154,6 +153,8 @@ $env:QWEN_OCR_DISABLE_LAYOUT="1"
 $env:QWEN_OCR_TEXT_DETECTION_MODEL_DIR="D:\models\text_detection"
 $env:QWEN_OCR_LAYOUT_MODEL_DIR="D:\models\layout_detection"
 ```
+
+PaddleX mặc định dùng cache model đã cài trong hồ sơ người dùng (thường là `C:\Users\<user>\.paddlex`). Khi đóng gói offline, có thể chỉ định rõ hai thư mục model bằng các biến `QWEN_OCR_TEXT_DETECTION_MODEL_DIR` và `QWEN_OCR_LAYOUT_MODEL_DIR` ở trên.
 
 CLI và GUI sẽ ghi rõ `layout enabled` hoặc `layout disabled` vào log khi bắt đầu xử lý.
 

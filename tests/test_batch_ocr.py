@@ -28,6 +28,9 @@ class BatchOcrTests(unittest.TestCase):
         malformed = "Viet Nam la nuoc co muc thu nhap trung binh va chuong trinh trong nam. " * 12
         self.assertTrue(needs_vision_retry(malformed))
 
+    def test_normal_vietnamese_does_not_request_vision_retry(self):
+        self.assertFalse(needs_vision_retry("Nội dung tiếng Việt hợp lệ và có đầy đủ dấu câu."))
+
     def test_valid_markdown_table_does_not_retry(self):
         markdown = "| Tên | Giá trị |\n|---|---|\n| GDP | 2109 |"
         self.assertFalse(needs_table_retry(markdown))
@@ -50,6 +53,12 @@ class BatchOcrTests(unittest.TestCase):
         self.assertNotIn("| Việt Nam |", repaired)
         self.assertIn("Trước", repaired)
         self.assertIn("Sau", repaired)
+
+    def test_html_conversion_escapes_cell_content(self):
+        markdown = "| A | B |\n|---|---|\n| <script> | 1 | extra |"
+        repaired = repair_markdown_tables(markdown)
+        self.assertIn("&lt;script&gt;", repaired)
+        self.assertNotIn("<script>", repaired)
 
     def test_separator_column_mismatch_becomes_html(self):
         markdown = "| A | B |\n|---|\n| 1 | 2 |"
