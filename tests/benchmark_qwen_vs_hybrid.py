@@ -1,7 +1,7 @@
 """Benchmark Qwen-only versus Paddle-layout + Qwen on the same PDFs.
 
 Run:
-    python tests/benchmark_qwen_vs_hybrid.py --input PDF --runs 1
+    python tests/benchmark_qwen_vs_hybrid.py --runs 1
 """
 
 from __future__ import annotations
@@ -168,7 +168,10 @@ def write_reports(rows: list[dict[str, object]], output_root: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="So sánh tài nguyên Qwen thuần và Hybrid trên cùng PDF.")
-    parser.add_argument("--input", type=Path, default=PROJECT_ROOT / "PDF", help="File PDF hoặc thư mục PDF.")
+    parser.add_argument(
+        "--input", type=Path, default=PROJECT_ROOT / "test_input",
+        help="File PDF hoặc thư mục PDF (mặc định: test_input).",
+    )
     parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "output" / "qwen_vs_hybrid")
     parser.add_argument("--runs", type=int, default=1, help="Số lượt cho mỗi mode/PDF.")
     args = parser.parse_args()

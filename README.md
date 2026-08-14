@@ -30,6 +30,26 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
 
 ---
 
+## Yêu cầu hệ thống (khuyến nghị)
+
+> Phần mềm vẫn có thể chạy khi không có GPU, nhưng Ollama sẽ chuyển sang CPU và tốc độ OCR sẽ chậm hơn đáng kể.
+
+* **Hệ điều hành:** Windows 10/11 64-bit hoặc Linux 64-bit.
+* **CPU:** Tối thiểu 4 lõi/8 luồng; khuyến nghị 8 lõi trở lên khi chạy hoàn toàn bằng CPU.
+* **RAM:** Tối thiểu 16 GB; khuyến nghị 24–32 GB khi xử lý PDF dài hoặc nhiều trang độ phân giải cao.
+* **GPU:** Không bắt buộc. Khuyến nghị GPU NVIDIA có CUDA và ít nhất 6 GB VRAM; 8 GB VRAM trở lên cho hiệu năng ổn định hơn.
+* **Dung lượng trống:** Tối thiểu khoảng 15 GB cho mã nguồn, môi trường Python, Ollama, model `qwen3.5:4b` và cache model Paddle/Layout; cần thêm dung lượng cho PDF và kết quả OCR.
+* **Phần mềm:** Python 3.10 trở lên và Ollama. Nếu dùng Docker cần Docker Desktop; chạy GPU trong Docker cần NVIDIA Container Toolkit.
+* **Kết nối mạng:** Chỉ cần trong lần cài đặt và tải model ban đầu. Sau khi đã tải đủ model Qwen, Paddle/Layout và LaTeX-OCR (nếu sử dụng), hệ thống có thể hoạt động offline; Ollama chỉ được gọi tại `localhost:11434`.
+
+### GPU và CPU fallback
+
+* Ollama tự phát hiện GPU tương thích và ưu tiên sử dụng GPU; nếu GPU không khả dụng, model Qwen sẽ chạy bằng CPU.
+* `requirements.txt` hiện cài `paddlepaddle` bản CPU. Muốn Paddle/Layout sử dụng GPU NVIDIA, cần thay bằng `paddlepaddle-gpu` tương thích với phiên bản CUDA của máy.
+* Nên kiểm tra log Ollama và mức sử dụng GPU để xác nhận model thực sự đang chạy trên GPU.
+
+---
+
 ## II. Luồng xử lý chính (Core Pipeline)
 
 Hệ thống xử lý từng file PDF qua luồng đa bước (pipeline) tự động để đảm bảo cấu trúc, bảng biểu, công thức toán và hình ảnh được giữ nguyên vẹn nhất:

@@ -13,7 +13,19 @@ import queue
 import tempfile
 import time
 import re
+import warnings
 from pathlib import Path
+
+# Third-party PaddleX/Protobuf code still uses deprecated datetime APIs on
+# Windows. Keep those dependency warnings out of the end-user activity log.
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"google\.protobuf(?:\..*)?")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"paddle(?:x|ocr)?(?:\..*)?")
+warnings.filterwarnings(
+    "ignore",
+    message=r"datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*",
+    category=DeprecationWarning,
+)
+
 # pyrefly: ignore [missing-import]
 from PIL import Image, ImageTk 
 # pyrefly: ignore [missing-import]
@@ -27,7 +39,7 @@ from app.core.batch_ocr import (
     QUALITY_RETRY_INSTRUCTION, apply_page_assets,
     extract_images_from_page as core_extract_images_from_page,
     finalize_markdown, link_extracted_images,
-    needs_table_retry, normalize_worker_count, page_is_tiled_scan, render_table_page, resolve_qwen_model,
+    needs_table_retry, normalize_worker_count, render_table_page, resolve_qwen_model,
     ocr_coordinate_blocks, ocr_qwen_images, PipelineCancelled,
 )
 import tkinter as tk
@@ -35,148 +47,6 @@ from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
 PROMPT = CORE_PROMPT
-LEGACY_PROMPT = """
-Convert this scanned document to Markdown format according to the following requirements:
-
-1. Remove unnecessary elements:
-   - Automatically detect and remove headers, footers, footnotes, and page numbers to make the content cleaner and clearer.
-
-2. Preserve the original document structure and layout:
-   - Maintain heading hierarchies (Heading #, ##, ###, ####), paragraphs, and lists (bulleted/numbered lists).
-   - CRITICAL: All question headers (e.g., "Câu 1.", "Câu 2.", "Câu 10.") must be strictly formatted as Heading Level 4: `#### Câu X.`. Do not use bold tags (`**Câu X.**`) or normal text for question headers.
-   - Ensure the correct natural reading order of the document. For multi-column layouts or multiple-choice questions side-by-side, read column-by-column and keep the options (A, B, C, D) associated with their correct question. Do not merge text across columns.
-
-3. Recognize special components:
-   - Mathematical expressions: Automatically convert all formulas, variables, subscripts (e.g., S_1 to $S_1$), primes (e.g., A' to $A'$), fractions (always use \\frac{num}{den} for vertical fractions), and math symbols into LaTeX format. Use $...$ for inline formulas and $$...$$ for block formulas. Do not repeat characters or duplicate terms.
-      * CRITICAL: Never use HTML space entities (such as &nbsp; or &amp;nbsp;) anywhere in the document. Use standard markdown spaces or newlines to separate options. Each mathematical expression must have its own closed pair of dollar signs ($). Never group non-mathematical text, punctuation, labels (like 'B.', 'C.', 'D.') inside a dollar sign pair.
-   - Tables: Extract tables accurately. For complex tables (with merged cells or multi-tiered headers), export them as HTML tables (<table>). For simple tables, use the standard Markdown table format.
-   - Images and captions: If images or diagrams are detected, represent them as a Markdown image tag with the description inside the square brackets and a placeholder path inside the parentheses, for example: `![Description of the image/diagram](image_placeholder.png)`. Never put descriptive text inside the parentheses.
-
-4. Vietnamese Language Corrections (Spelling & Diacritics):
-   - Correct any spelling, typographic, or diacritic errors in Vietnamese text. Pay special attention to accents/diacritics to ensure the output is grammatically correct and meaningful in Vietnamese context (for example, correct "vấn kiện" / "vấn kiến" to "văn kiện", "chương nghị sự" to "chương trình nghị sự").
-
-5. General requirements:
-   - Do not summarize the content, keep both Vietnamese and English text exactly as written.
-   - Return only the raw Markdown content, do not wrap it inside ```markdown code blocks.
-""".strip()
-
-
-def _legacy_extract_images_from_page(pdf_path: Path, page_index: int, output_img_dir: Path, prefix: str) -> list[str]:
-    doc = pymupdf.open(pdf_path)
-    page = doc.load_page(page_index)
-    image_list = page.get_images(full=True)
-    tiled_scan = page_is_tiled_scan(pdf_path, page_index)
-    if not tiled_scan:
-        image_list = sorted(
-            image_list,
-            key=lambda info: min(
-                ((rect.y0, rect.x0) for rect in page.get_image_rects(info[0])),
-                default=(float("inf"), float("inf")),
-            ),
-        )
-    
-    extracted_paths = []
-    output_img_dir.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Trích xuất ảnh raster nhúng sẵn
-    for img_idx, img_info in enumerate(() if tiled_scan else image_list, 1):
-        xref = img_info[0]
-        try:
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-            
-            img_name = f"{prefix}_page_{page_index + 1}_img_{img_idx}.{image_ext}"
-            img_path = output_img_dir / img_name
-            img_path.write_bytes(image_bytes)
-            
-            extracted_paths.append(f"images/{img_name}")
-        except Exception as e:
-            print(f"Error extracting image xref {xref} on page {page_index}: {e}")
-            
-    # 2. Phát hiện và crop các cụm hình vẽ vector (diagrams/drawings)
-    try:
-        drawings = page.get_drawings()
-        page_rect = page.rect
-        page_width = page_rect.width
-        page_height = page_rect.height
-        
-        candidate_rects = []
-        for d in drawings:
-            r = d["rect"]
-            if r.is_empty:
-                continue
-            # Bỏ qua phần header (12% trên) và footer (12% dưới)
-            if r.y1 < page_height * 0.12 or r.y0 > page_height * 0.88:
-                continue
-            # Bỏ qua các đường kẻ viền chiếm gần hết chiều ngang hoặc dọc trang
-            if r.width > page_width * 0.9 or r.height > page_height * 0.9:
-                continue
-            candidate_rects.append(r)
-            
-        if candidate_rects:
-            # Gom nhóm các rect đè nhau hoặc ở gần nhau
-            threshold = 30
-            merged = []
-            for r in candidate_rects:
-                placed = False
-                for idx, m in enumerate(merged):
-                    dilated_m = pymupdf.Rect(m.x0 - threshold, m.y0 - threshold, m.x1 + threshold, m.y1 + threshold)
-                    if dilated_m.intersects(r):
-                        merged[idx] = m | r
-                        placed = True
-                        break
-                if not placed:
-                    merged.append(r)
-            
-            # Gom nhóm đệ quy cho đến khi không gộp thêm được nữa
-            changed = True
-            while changed:
-                changed = False
-                new_merged = []
-                for r in merged:
-                    placed = False
-                    for idx, nm in enumerate(new_merged):
-                        dilated_nm = pymupdf.Rect(nm.x0 - threshold, nm.y0 - threshold, nm.x1 + threshold, nm.y1 + threshold)
-                        if dilated_nm.intersects(r):
-                            new_merged[idx] = nm | r
-                            placed = True
-                            changed = True
-                            break
-                    if not placed:
-                        new_merged.append(r)
-                merged = new_merged
-            
-            # Ignore vector clusters that are actually glyph-based page text.
-            text_word_centres = [
-                pymupdf.Point((word[0] + word[2]) / 2, (word[1] + word[3]) / 2)
-                for word in page.get_text("words")
-            ]
-            # Render và lưu từng cụm diagram
-            for c_idx, rect in enumerate(merged, len(image_list) + 1):
-                if sum(rect.contains(centre) for centre in text_word_centres) >= 30:
-                    continue
-                padding = 10
-                crop_rect = pymupdf.Rect(
-                    max(0, rect.x0 - padding),
-                    max(0, rect.y0 - padding),
-                    min(page_width, rect.x1 + padding),
-                    min(page_height, rect.y1 + padding)
-                )
-                zoom = 300 / 72
-                mat = pymupdf.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat, clip=crop_rect)
-                
-                img_name = f"{prefix}_page_{page_index + 1}_draw_{c_idx}.png"
-                img_path = output_img_dir / img_name
-                pix.save(str(img_path))
-                
-                extracted_paths.append(f"images/{img_name}")
-    except Exception as dev_err:
-        print(f"Error extracting vector drawings on page {page_index}: {dev_err}")
-            
-    doc.close()
-    return extracted_paths
 
 def merge_markdown_tables(markdown_text: str) -> str:
     lines = markdown_text.splitlines()
@@ -352,9 +222,7 @@ def post_process_markdown(text: str) -> str:
     )
 
 
-# The desktop frontend deliberately delegates OCR helpers to the core pipeline.
-# Legacy local definitions above remain temporarily for source compatibility but
-# are not used by OCRWorker.
+# The desktop frontend delegates OCR helpers to the core pipeline.
 extract_images_from_page = core_extract_images_from_page
 clean_markdown = core_clean_markdown
 
@@ -510,7 +378,6 @@ class OCRWorker:
 
                         try:
                             output_img_dir = self.output_dir / "images"
-                            from app.core.batch_ocr import extract_images_from_page
                             extracted_paths = extract_images_from_page(
                                 pdf_path, idx, output_img_dir, pdf_path.stem,
                                 layout_detector=layout_detector,
