@@ -192,10 +192,20 @@ qwen-ocr-ollama/
 ├── .venv/                      # Môi trường ảo Python (được ignore trên Git)
 ├── app/
 │   ├── core/                   # Logic cốt lõi xử lý OCR, render PDF
-│   │   ├── batch_ocr.py        # Logic xử lý hàng loạt
-│   │   ├── ocr_validator.py    # Kiểm tra chất lượng Markdown đầu ra
-│   │   ├── pdf_ocr.py          # Điều phối quy trình OCR toàn bộ tệp PDF
-│   │   └── pdf_renderer.py     # Render PDF sang ảnh tạm thời
+│   │   ├── batch_ocr.py        # Pipeline OCR hàng loạt dùng chung cho CLI/GUI
+│   │   ├── block_assembler.py  # Lắp ráp khối chữ, bảng và ảnh theo luồng đọc
+│   │   ├── formula_ocr.py      # Nhận diện công thức tùy chọn bằng LaTeX-OCR
+│   │   ├── layout_detector.py  # PaddleOCR layout, cột, bảng, ảnh và overlay
+│   │   ├── math_cleanup.py     # Chuẩn hóa và kiểm tra cấu trúc LaTeX/đáp án
+│   │   ├── ocr_metrics.py      # Chỉ số đánh giá kết quả OCR/Markdown
+│   │   ├── ocr_validator.py    # Kiểm tra tính hợp lệ của Markdown đầu ra
+│   │   ├── ollama_engine.py    # Adapter Qwen Vision qua Ollama
+│   │   ├── paddle_engine.py    # Adapter PaddleOCR và sắp xếp dòng theo tọa độ
+│   │   ├── pdf_ocr.py          # Điều phối OCR PDF và ưu tiên text layer
+│   │   ├── pdf_renderer.py     # API duy nhất render toàn bộ hoặc trang PDF chọn lọc
+│   │   ├── pdf_rerender.py     # Shim tương thích, re-export từ pdf_renderer
+│   │   ├── pdf_text_layer.py   # Phát hiện và trích xuất text layer PDF
+│   │   └── quality_gate.py     # Quality gate, cảnh báo, retry và chọn bản tốt nhất
 │   │
 │   └── gui/                    # Giao diện đồ họa ứng dụng
 │       └── run_gui.py          # Triển khai giao diện đồ họa Tkinter
@@ -203,10 +213,15 @@ qwen-ocr-ollama/
 ├── PDF/                        # Thư mục chứa các tệp PDF đầu vào mặc định
 ├── OCR/                        # Thư mục chứa kết quả Markdown & ảnh (images/) đầu ra mặc định
 ├── samples/                    # Dữ liệu mẫu thử nghiệm
+├── tests/                      # Unit test, integration test và benchmark
+│   ├── test_*.py               # Bộ kiểm thử tự động
+│   ├── test_benchmark_images.py # Benchmark OCR ảnh lặp lại
+│   └── benchmark_dpi.py        # Benchmark lựa chọn DPI
 │
 ├── run_gui.py                  # File chuyển tiếp khởi chạy GUI từ thư mục gốc
 ├── batch_ocr.py                # File chuyển tiếp chạy Batch OCR từ thư mục gốc
 ├── ocr_validator.py            # File chuyển tiếp chạy Validator từ thư mục gốc
 ├── requirements.txt            # Danh sách thư viện phụ thuộc
+├── requirements-formula.txt    # Dependency tùy chọn cho LaTeX-OCR/pix2tex
 └── README.md                   # Hướng dẫn cài đặt và sử dụng dự án (File này)
 ```

@@ -20,6 +20,8 @@ class GuiWorkerControlTests(unittest.TestCase):
         self.assertIs(run_gui.clean_markdown, batch_ocr.clean_markdown)
         self.assertIs(run_gui.ocr_qwen_images, batch_ocr.ocr_qwen_images)
         self.assertIs(run_gui.finalize_markdown, batch_ocr.finalize_markdown)
+        self.assertEqual(run_gui.PROMPT, batch_ocr.PROMPT)
+        self.assertEqual(run_gui.MODEL, batch_ocr.MODEL)
         sample = "```markdown\n| A | B |\n|---|---|\n| 1 | 2 |\n```"
         self.assertEqual(
             run_gui.finalize_markdown(run_gui.clean_markdown(sample)),

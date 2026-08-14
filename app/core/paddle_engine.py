@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 
@@ -85,7 +86,7 @@ class PaddleOCREngine:
         except Exception as error:
             raise RuntimeError(f"Lỗi khi chạy PaddleOCR 3.x: {error}") from error
 
-        lines: list[tuple[float, float, str]] = []
+        items: list[tuple[float, float, float, float, str]] = []
         for result in results:
             data = self._result_data(result)
             texts = data.get("rec_texts", [])
@@ -98,10 +99,38 @@ class PaddleOCREngine:
                 if score < self.confidence_threshold or not str(text).strip():
                     continue
                 box = boxes[index] if index < len(boxes) else [[0, 0]]
-                x, y = float(box[0][0]), float(box[0][1])
-                lines.append((y, x, str(text).strip()))
+                xs = [float(point[0]) for point in box]
+                ys = [float(point[1]) for point in box]
+                x = min(xs)
+                center_y = (min(ys) + max(ys)) / 2
+                height = max(max(ys) - min(ys), 1.0)
+                items.append((center_y, x, min(ys), max(ys), str(text).strip()))
 
-        # Sắp xếp kết quả nhận diện chữ theo trục Y (dòng), sau đó trục X (cột)
-        lines.sort(key=lambda item: (item[0], item[1]))
-        return "\n".join(text for _, _, text in lines)
+        if not items:
+            return ""
 
+        # Cluster boxes whose vertical centres differ only by scan/detection
+        # jitter, then sort fragments left-to-right inside each visual line.
+        typical_height = median(item[3] - item[2] for item in items)
+        base_threshold = max(3.0, typical_height * 0.5)
+        rows: list[list[tuple[float, float, float, float, str]]] = []
+        for item in sorted(items, key=lambda value: value[0]):
+            if not rows:
+                rows.append([item])
+                continue
+            row = rows[-1]
+            row_center = sum(value[0] for value in row) / len(row)
+            row_top = median(value[2] for value in row)
+            row_bottom = median(value[3] for value in row)
+            overlap = max(0.0, min(item[3], row_bottom) - max(item[2], row_top))
+            min_height = max(1.0, min(item[3] - item[2], row_bottom - row_top))
+            same_line = overlap / min_height >= 0.35 or abs(item[0] - row_center) <= base_threshold * 0.65
+            if same_line:
+                row.append(item)
+            else:
+                rows.append([item])
+
+        return "\n".join(
+            " ".join(item[4] for item in sorted(row, key=lambda value: value[1]))
+            for row in rows
+        )

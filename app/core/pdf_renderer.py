@@ -9,6 +9,32 @@ from pathlib import Path
 import pymupdf
 
 
+def render_pdf(
+    pdf_path: str | Path,
+    output_dir: str | Path,
+    dpi: int = 200,
+    page_numbers: set[int] | None = None,
+):
+    """Yield ``(one_based_page_number, image_path)`` for selected PDF pages."""
+    pdf_path = Path(pdf_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    document = pymupdf.open(pdf_path)
+    try:
+        for index in range(document.page_count):
+            page_number = index + 1
+            if page_numbers is not None and page_number not in page_numbers:
+                continue
+            pix = document.load_page(index).get_pixmap(
+                dpi=dpi, colorspace=pymupdf.csRGB, alpha=False,
+            )
+            image_path = output_dir / f"page_{page_number:05d}.png"
+            pix.save(str(image_path))
+            yield page_number, image_path
+    finally:
+        document.close()
+
+
 # Hàm render toàn bộ PDF thành mảng đường dẫn file ảnh PNG
 def render_pdf_to_images(
     pdf_path: str | Path,
@@ -30,22 +56,4 @@ def render_pdf_to_images(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    saved_images = []
-    doc = pymupdf.open(pdf_path)
-    try:
-        for index in range(len(doc)):
-            page = doc.load_page(index)
-            # Render trang thành pixmap với DPI chỉ định
-            pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
-            
-            # Tên file ảnh đầu ra dạng page_00001.png
-            image_name = f"page_{index + 1:05d}.png"
-            image_path = output_dir / image_name
-            
-            pix.save(str(image_path))
-            saved_images.append(image_path)
-    finally:
-        doc.close()
-        
-    return saved_images
-
+    return [image_path for _, image_path in render_pdf(pdf_path, output_dir, dpi=dpi)]

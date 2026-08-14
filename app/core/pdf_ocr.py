@@ -19,7 +19,7 @@ from app.core.ollama_engine import (
     OllamaQwenEngine,
 )
 
-from app.core.pdf_rerender import (
+from app.core.pdf_renderer import (
     render_pdf,
 )
 from app.core.pdf_text_layer import extract_native_text

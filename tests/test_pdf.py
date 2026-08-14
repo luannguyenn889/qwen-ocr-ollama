@@ -1,5 +1,9 @@
 # Nhiệm vụ: Kiểm tra quy trình trích xuất trang PDF, render thành ảnh tạm thời, thực hiện OCR từng trang bằng OllamaQwenEngine và in kết quả ra terminal để kiểm tra nhanh.
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("integration test; run directly with python tests/test_pdf.py")
+
 import sys
 import tempfile
 from pathlib import Path
@@ -14,7 +18,7 @@ from app.core.ollama_engine import (
     OllamaQwenEngine,
 )
 
-from app.core.pdf_rerender import (
+from app.core.pdf_renderer import (
     render_pdf,
 )
 

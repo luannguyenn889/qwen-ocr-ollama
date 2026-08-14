@@ -21,7 +21,8 @@ import pymupdf  # PyMuPDF
 # pyrefly: ignore [missing-import]
 from ollama import Client
 from app.core.batch_ocr import (
-    ENABLE_LAYOUT_DETECTION, TABLE_HTML_RETRY_INSTRUCTION, TABLE_RENDER_DPI, TABLE_SAFE_INSTRUCTION,
+    ENABLE_LAYOUT_DETECTION, MODEL, PROMPT as CORE_PROMPT,
+    TABLE_HTML_RETRY_INSTRUCTION, TABLE_RENDER_DPI, TABLE_SAFE_INSTRUCTION,
     TABLE_STRUCTURE_REPAIR_PROMPT, clean_markdown as core_clean_markdown,
     QUALITY_RETRY_INSTRUCTION, apply_page_assets,
     extract_images_from_page as core_extract_images_from_page,
@@ -33,8 +34,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
 
-MODEL = "qwen3.5:4b"
-PROMPT = """
+PROMPT = CORE_PROMPT
+LEGACY_PROMPT = """
 Convert this scanned document to Markdown format according to the following requirements:
 
 1. Remove unnecessary elements:
@@ -60,7 +61,7 @@ Convert this scanned document to Markdown format according to the following requ
 """.strip()
 
 
-def extract_images_from_page(pdf_path: Path, page_index: int, output_img_dir: Path, prefix: str) -> list[str]:
+def _legacy_extract_images_from_page(pdf_path: Path, page_index: int, output_img_dir: Path, prefix: str) -> list[str]:
     doc = pymupdf.open(pdf_path)
     page = doc.load_page(page_index)
     image_list = page.get_images(full=True)
@@ -469,28 +470,24 @@ class OCRWorker:
                         self.progress_queue.put(("page_timer_start", (page_num, started_at)))
                         paddle_seconds = 0.0
                         qwen_seconds = 0.0
+                        qwen_first_seconds = 0.0
+                        retry_seconds = 0.0
                         extracted_paths = []
-                        try:
-                            output_img_dir = self.output_dir / "images"
-                            from app.core.batch_ocr import extract_images_from_page
-                            with self.layout_lock:
-                                extracted_paths = extract_images_from_page(
-                                    pdf_path, idx, output_img_dir, pdf_path.stem,
-                                    layout_detector=layout_detector,
-                                    page_image_path=img_path
-                                )
-                        except Exception as img_err:
-                            self.progress_queue.put(("log", f"    -> [Chú ý] Không thể trích xuất ảnh: {img_err}\n"))
 
                         qwen_images = [img_path]
                         has_table = False
                         ordered_blocks = []
+                        page_analysis = None
                         if layout_detector is not None:
                             try:
                                 paddle_started_at = time.perf_counter()
                                 with self.layout_lock:
-                                    columns, has_table, text_regions, table_regions = layout_detector.analyse_with_regions(img_path)
-                                    ordered_blocks = layout_detector.detect_ordered_blocks(img_path.read_bytes())
+                                    page_analysis = layout_detector.analyse_page(img_path)
+                                columns = page_analysis.segments
+                                has_table = bool(page_analysis.tables)
+                                text_regions = [bbox for kind, bbox in page_analysis.blocks if kind in {"text", "heading", "formula"}]
+                                table_regions = page_analysis.tables
+                                ordered_blocks = page_analysis.blocks
                                 paddle_seconds = time.perf_counter() - paddle_started_at
                                 from app.core.layout_detector import save_layout_overlay
                                 overlay_path = save_layout_overlay(
@@ -510,6 +507,19 @@ class OCRWorker:
                                 self.progress_queue.put(("log", f"    -> [Chú ý] Layout lỗi, dùng nguyên trang: {layout_error}\n"))
                                 qwen_images, has_table = [img_path], False
                                 ordered_blocks = []
+
+                        try:
+                            output_img_dir = self.output_dir / "images"
+                            from app.core.batch_ocr import extract_images_from_page
+                            extracted_paths = extract_images_from_page(
+                                pdf_path, idx, output_img_dir, pdf_path.stem,
+                                layout_detector=layout_detector,
+                                page_image_path=img_path,
+                                segments=page_analysis.segments if page_analysis else None,
+                                detected_images=page_analysis.images if page_analysis else [],
+                            )
+                        except Exception as img_err:
+                            self.progress_queue.put(("log", f"    -> [Chú ý] Không thể trích xuất ảnh: {img_err}\n"))
 
                         qwen_started_at = time.perf_counter()
 
@@ -537,18 +547,20 @@ class OCRWorker:
                         except PipelineCancelled:
                             return None
                         qwen_seconds = time.perf_counter() - qwen_started_at
+                        qwen_first_seconds = qwen_seconds
                         
                         if extracted_paths:
                             self.progress_queue.put(("log", f"    -> Đã trích xuất {len(extracted_paths)} hình ảnh từ PDF trang {page_num}.\n"))
                         page_md = apply_page_assets(page_md, page_num, extracted_paths)
 
                         from app.core.quality_gate import choose_best_page, evaluate_page
-                        quality = evaluate_page(page_md, self.output_dir)
+                        quality = evaluate_page(page_md, self.output_dir, check_tables=has_table)
                         if quality.warnings:
                             self.progress_queue.put(("log", f"    -> [Cảnh báo] Trang {page_num}: {', '.join(quality.warnings)}\n"))
                         if not quality.passed:
                             initial_md, initial_quality = page_md, quality
                             self.progress_queue.put(("log", f"    -> Quality retry trang {page_num}: {', '.join(quality.errors)}\n"))
+                            retry_started_at = time.perf_counter()
                             try:
                                 retry_md = ocr_qwen_images(
                                     self.client,
@@ -566,12 +578,13 @@ class OCRWorker:
                                 self.progress_queue.put(("log", f"    -> [Cảnh báo] Retry trang {page_num} bị lỗi; giữ kết quả ban đầu: {retry_error}\n"))
                             else:
                                 retry_md = apply_page_assets(retry_md, page_num, extracted_paths)
-                                retry_quality = evaluate_page(retry_md, self.output_dir)
+                                retry_quality = evaluate_page(retry_md, self.output_dir, check_tables=has_table)
                                 if retry_quality.warnings:
                                     self.progress_queue.put(("log", f"    -> [Cảnh báo] Retry trang {page_num}: {', '.join(retry_quality.warnings)}\n"))
                                 page_md, quality = choose_best_page(
                                     initial_md, initial_quality, retry_md, retry_quality
                                 )
+                            retry_seconds = time.perf_counter() - retry_started_at
                             if not quality.passed:
                                 self.progress_queue.put((
                                     "log",
@@ -581,7 +594,7 @@ class OCRWorker:
 
                         qwen_seconds = time.perf_counter() - qwen_started_at
                         elapsed = time.perf_counter() - started_at
-                        self.progress_queue.put(("log", f"    Render: {render_timings[idx]:.1f}s | Paddle: {paddle_seconds:.1f}s | Qwen: {qwen_seconds:.1f}s\n"))
+                        self.progress_queue.put(("log", f"    Benchmark: Render {render_timings[idx]:.1f}s | Layout {paddle_seconds:.1f}s | Qwen lần đầu {qwen_first_seconds:.1f}s | Retry {retry_seconds:.1f}s | Formula OCR 0.0s\n"))
                         self.progress_queue.put(("log", f"    -> Hoàn thành Trang {page_num} ({elapsed:.1f} giây)\n"))
                         
                         with self.progress_lock:
@@ -638,9 +651,12 @@ class OCRWorker:
                     except Exception as pp_err:
                         self.progress_queue.put(("log", f"    -> [Chú ý] Không thể hoàn thiện Markdown: {pp_err}\n"))
                     temp_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
+                    write_started_at = time.perf_counter()
                     temp_output_path.write_text(final_md, encoding="utf-8")
                     os.replace(temp_output_path, output_path)
+                    write_seconds = time.perf_counter() - write_started_at
                     self.progress_queue.put(("log", f"  - Đã lưu kết quả tại: {output_path.name}\n"))
+                    self.progress_queue.put(("log", f"  - Benchmark ghi file: {write_seconds:.3f}s\n"))
                     file_elapsed = time.perf_counter() - pdf_start_time
                     self.progress_queue.put(("log", f"  - Tổng thời gian OCR file: {format_elapsed(file_elapsed)}\n"))
             

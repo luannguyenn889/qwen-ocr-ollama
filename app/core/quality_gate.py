@@ -171,7 +171,9 @@ def _table_errors(markdown: str) -> list[str]:
     return errors
 
 
-def evaluate_page(markdown: str, output_dir: str | Path) -> QualityReport:
+def evaluate_page(
+    markdown: str, output_dir: str | Path, *, check_tables: bool = True
+) -> QualityReport:
     errors: list[str] = []
     warnings: list[str] = []
     if not markdown.strip():
@@ -199,8 +201,11 @@ def evaluate_page(markdown: str, output_dir: str | Path) -> QualityReport:
 
     if len(re.findall(r"(?<!\\)\$", markdown)) % 2:
         errors.append("unbalanced_math_delimiters")
+    from app.core.math_cleanup import math_quality_errors
+    errors.extend(math_quality_errors(markdown))
 
-    errors.extend(_table_errors(markdown))
+    if check_tables:
+        errors.extend(_table_errors(markdown))
     if PLACEHOLDER_RE.search(markdown):
         errors.append("unresolved_placeholder")
 

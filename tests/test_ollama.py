@@ -1,5 +1,9 @@
 # Nhiệm vụ: Kiểm tra kết nối cơ bản tới Ollama server và test tính năng sinh văn bản (text generation) đơn giản bằng model qwen3.5:4b.
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("integration test; run directly with python tests/test_ollama.py")
+
 # pyrefly: ignore [missing-import]
 from ollama import Client
 

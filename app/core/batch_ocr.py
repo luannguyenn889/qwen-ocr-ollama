@@ -189,7 +189,8 @@ def extract_images_from_page(
     pdf_path: Path, page_index: int, output_img_dir: Path, prefix: str,
     layout_detector=None,
     page_image_path: Path | None = None,
-    segments: list[BoundingBox] | None = None
+    segments: list[BoundingBox] | None = None,
+    detected_images: list[BoundingBox] | None = None,
 ) -> list[str]:
     """Trích xuất hình ảnh trang bằng PP-DocLayout khi khả dụng; nếu không sẽ lùi về dùng PyMuPDF."""
     # pyrefly: ignore [missing-import]
@@ -217,8 +218,9 @@ def extract_images_from_page(
                 img_width = img.width
                 img_height = img.height
             
-            # Phát hiện bảng biểu và ảnh bằng Paddle
-            _, detected_images = layout_detector.detect_layout_tables_and_images(image_bytes)
+            # Reuse the caller's single page analysis when available.
+            if detected_images is None:
+                _, detected_images = layout_detector.detect_layout_tables_and_images(image_bytes)
             
             if detected_images:
                 with Image.open(page_image_path) as image:
@@ -344,9 +346,13 @@ def extract_images_from_page(
                         min(page_width, rect.x1 + padding),
                         min(page_height, rect.y1 + padding)
                     )
+                    if crop_rect.get_area() < page_width * page_height * 0.002:
+                        continue
                     zoom = 300 / 72
                     mat = pymupdf.Matrix(zoom, zoom)
                     pix = page.get_pixmap(matrix=mat, clip=crop_rect)
+                    if pix.width < 40 or pix.height < 40:
+                        continue
                     
                     img_name = f"{prefix}_page_{page_index + 1}_draw_{c_idx}.png"
                     img_path = output_img_dir / img_name
@@ -651,16 +657,21 @@ def link_extracted_images(markdown: str, extracted_paths: list[str]) -> tuple[st
 
 def apply_page_assets(markdown: str, page_number: int, image_paths: list[str], formulas: list[str] | None = None) -> str:
     """Replace formula/image placeholders and append images the model did not place."""
-    if formulas:
+    if formulas is not None:
         iterator = iter(formulas)
+        unused_formulas = list(formulas)
 
         def replace_formula(match):
             try:
-                return next(iterator)
+                value = next(iterator)
+                unused_formulas.pop(0)
+                return value
             except StopIteration:
-                return match.group(0)
+                return ""
 
         markdown = re.sub(r"formula_placeholder", replace_formula, markdown, flags=re.IGNORECASE)
+        if unused_formulas:
+            markdown = f"{markdown.rstrip()}\n\n" + "\n\n".join(unused_formulas)
     pending_images = [path for path in image_paths if f"]({path})" not in markdown]
     markdown, unplaced = link_extracted_images(markdown, pending_images)
     # Qwen may emit more image placeholders than the PDF extractor finds (it
@@ -750,7 +761,8 @@ def clean_markdown(text: str) -> str:
         return match.group(0)
 
     text = re.sub(r"\$([^$\n]+)\$", repl, text)
-    return text
+    from app.core.math_cleanup import normalize_answer_math
+    return normalize_answer_math(text)
 
 
 def post_process_markdown(text: str) -> str:
@@ -779,7 +791,7 @@ def post_process_markdown(text: str) -> str:
         processed_lines.append(line)
 
     result = "\n".join(processed_lines)
-    return re.sub(
+    result = re.sub(
         r"(?<!\$)\$([^$\n]+)\$(?!\$)",
         lambda match: match.group(1)
         if len(match.group(1).split()) >= 6
@@ -787,6 +799,8 @@ def post_process_markdown(text: str) -> str:
         else match.group(0),
         result,
     )
+    from app.core.math_cleanup import normalize_answer_math
+    return normalize_answer_math(result)
 
 
 def finalize_markdown(markdown: str) -> str:
@@ -874,6 +888,20 @@ def ocr_qwen_images(
     extra_instruction: str = "", log_func=print, before_request=None,
 ) -> str:
     """Canonical Qwen OCR and table-retry flow shared by CLI and GUI."""
+    def consume(chunks) -> str:
+        collected: list[str] = []
+        try:
+            for chunk in chunks:
+                if before_request is not None:
+                    before_request()
+                collected.append(chunk.response)
+        except BaseException:
+            close = getattr(chunks, "close", None)
+            if callable(close):
+                close()
+            raise
+        return "".join(collected)
+
     parts = []
     for image_number, image_path in enumerate(images, 1):
         if before_request is not None:
@@ -890,7 +918,7 @@ def ocr_qwen_images(
             ),
             log_func=log_func,
         )
-        parts.append(clean_markdown("".join(chunk.response for chunk in chunks)))
+        parts.append(clean_markdown(consume(chunks)))
 
     markdown = "\n\n".join(part for part in parts if part.strip())
     if has_table and needs_table_retry(markdown):
@@ -908,7 +936,7 @@ def ocr_qwen_images(
             ),
             log_func=log_func,
         )
-        markdown = clean_markdown("".join(chunk.response for chunk in chunks))
+        markdown = clean_markdown(consume(chunks))
         if needs_table_retry(markdown):
             log_func("Table structural repair.")
             if before_request is not None:
@@ -924,7 +952,7 @@ def ocr_qwen_images(
                 ),
                 log_func=log_func,
             )
-            markdown = clean_markdown("".join(chunk.response for chunk in chunks))
+            markdown = clean_markdown(consume(chunks))
     return markdown
 
 
@@ -1025,17 +1053,23 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             has_table = False
             segments = None
             ordered_blocks = []
+            page_analysis = None
             render_seconds = render_timings.get(img_path, 0.0)
             paddle_seconds = 0.0
             qwen_seconds = 0.0
+            qwen_first_seconds = 0.0
+            retry_seconds = 0.0
+            formula_seconds = 0.0
 
             # Phân tích bố cục bằng PaddleOCR nếu bộ phát hiện được nạp thành công
             if layout_detector is not None:
                 try:
                     paddle_started_at = perf_counter()
                     with layout_lock:
-                        segments, has_table = layout_detector.analyse(img_path)
-                        ordered_blocks = layout_detector.detect_ordered_blocks(img_path.read_bytes())
+                        page_analysis = layout_detector.analyse_page(img_path)
+                    segments = page_analysis.segments
+                    has_table = bool(page_analysis.tables)
+                    ordered_blocks = page_analysis.blocks
                     paddle_seconds = perf_counter() - paddle_started_at
                     if segments and len(segments) >= 2:
                         from app.core.layout_detector import crop_segments
@@ -1059,7 +1093,8 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                     pdf_path, idx, output_img_dir, pdf_path.stem,
                     layout_detector=layout_detector,
                     page_image_path=img_path,
-                    segments=segments
+                    segments=segments,
+                    detected_images=page_analysis.images if page_analysis else [],
                 )
             except Exception as img_err:
                 print(f"    -> [Warning] Failed to extract images: {img_err}")
@@ -1067,9 +1102,9 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             # 1.5. Trích xuất công thức toán học từ trang PDF bằng LaTeX-OCR
             formulas_latex = []
             if layout_detector is not None and ENABLE_LAYOUT_DETECTION:
+                formula_started_at = perf_counter()
                 try:
-                    image_bytes = img_path.read_bytes()
-                    _, _, detected_formulas = layout_detector.detect_layout_tables_images_and_formulas(image_bytes)
+                    detected_formulas = page_analysis.formulas if page_analysis else []
                     if detected_formulas:
                         def get_segment_idx(bbox):
                             center_x = (bbox[0] + bbox[2]) / 2
@@ -1111,6 +1146,8 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                         print(f"    -> Extracted {len(formulas_latex)} formulas via LaTeX-OCR on page {page_num}.")
                 except Exception as formula_err:
                     print(f"    -> [Warning] Failed to extract formulas: {formula_err}")
+                finally:
+                    formula_seconds = perf_counter() - formula_started_at
 
             # 2. Thực hiện OCR và làm sạch kết quả bằng Qwen
             qwen_model = hybrid_model if is_hybrid else resolve_qwen_model(model_name)
@@ -1135,6 +1172,7 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                         log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
                     )
                 qwen_seconds = perf_counter() - qwen_started_at
+                qwen_first_seconds = qwen_seconds
             except Exception as ollama_err:
                 qwen_seconds = perf_counter() - qwen_started_at
                 error = f"Qwen OCR failed: {ollama_err}"
@@ -1148,12 +1186,13 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             # 3. Quality gate: retry only this page once from the original full-page image.
             if not error:
                 from app.core.quality_gate import choose_best_page, evaluate_page
-                report = evaluate_page(page_md, output_dir)
+                report = evaluate_page(page_md, output_dir, check_tables=has_table)
                 if report.warnings:
                     print(f"    -> [Warning] Page {page_num}: {', '.join(report.warnings)}")
                 if not report.passed:
                     initial_md, initial_report = page_md, report
                     print(f"    -> Quality retry page {page_num}: {', '.join(report.errors)}")
+                    retry_started_at = perf_counter()
                     try:
                         retry_md = ocr_qwen_images(
                             client, qwen_model, [img_path], has_table=has_table,
@@ -1161,7 +1200,7 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                             log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
                         )
                         retry_md = apply_page_assets(retry_md, page_num, extracted_img_paths, formulas_latex)
-                        second_report = evaluate_page(retry_md, output_dir)
+                        second_report = evaluate_page(retry_md, output_dir, check_tables=has_table)
                         if second_report.warnings:
                             print(f"    -> [Warning] Retry page {page_num}: {', '.join(second_report.warnings)}")
                         page_md, report = choose_best_page(
@@ -1170,6 +1209,8 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                     except Exception as retry_error:
                         page_md, report = initial_md, initial_report
                         print(f"    -> [Warning] Quality retry failed on page {page_num}; keeping original result: {retry_error}")
+                    finally:
+                        retry_seconds = perf_counter() - retry_started_at
                     if not report.passed:
                         print(
                             f"    -> [Warning] Page {page_num} still failed quality gate "
@@ -1178,7 +1219,11 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
 
             qwen_seconds = perf_counter() - qwen_started_at if 'qwen_started_at' in locals() else qwen_seconds
             elapsed = perf_counter() - started_at
-            print(f"    Render: {render_seconds:.1f}s | Paddle: {paddle_seconds:.1f}s | Qwen: {qwen_seconds:.1f}s")
+            print(
+                f"    Benchmark: Render {render_seconds:.1f}s | Layout {paddle_seconds:.1f}s | "
+                f"Qwen first {qwen_first_seconds:.1f}s | Retry {retry_seconds:.1f}s | "
+                f"Formula OCR {formula_seconds:.1f}s"
+            )
             print(f"Page {page_num} done in {elapsed:.1f}s.")
             return page_num, page_md, error
 
@@ -1207,9 +1252,12 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             final_md = finalize_markdown(final_md)
         except Exception as merge_err:
             print(f"    -> [Warning] Failed to finalize Markdown: {merge_err}")
+        write_started_at = perf_counter()
         temp_output_path.write_text(final_md, encoding="utf-8")
         os.replace(temp_output_path, output_path)
+        write_seconds = perf_counter() - write_started_at
         print(f"Saved OCR to {output_path}")
+        print(f"Write benchmark: {write_seconds:.3f}s")
         document_elapsed = perf_counter() - document_started_at
         average = document_elapsed / total_pages if total_pages else 0.0
         print(f"Performance: workers={workers}, total={document_elapsed:.2f}s, average={average:.2f}s/page")

@@ -161,25 +161,5 @@ class OllamaQwenEngine:
         # Dọn dẹp các thực thể khoảng trắng HTML
         text = text.replace("&nbsp;", " ")
         text = text.replace("&amp;nbsp;", " ")
-        # Sửa lỗi bao bọc toán học sai cách (ví dụ: trải dài qua nhiều mục trắc nghiệm)
-        def fix_math_wraparound(match: re.Match) -> str:
-            full = match.group(0)
-            inner = match.group(1)
-            parts = re.split(r"([A-D]\.\s+)", inner)
-
-            if len(parts) > 1:
-                new_parts = []
-                for part in parts:
-                    if re.match(r"^\s+[B-D]\.\s+$", part):
-                        new_parts.append(part)
-                    else:
-                        stripped = part.strip()
-                        if stripped:
-                            new_parts.append(f"${stripped}$")
-                        else:
-                            new_parts.append(part)
-                return "".join(new_parts)
-            return match.group(0)
-
-        text = re.sub(r"\$([^$\n]+)\$", fix_math_wraparound, text)
-        return text
+        from app.core.math_cleanup import normalize_answer_math
+        return normalize_answer_math(text)

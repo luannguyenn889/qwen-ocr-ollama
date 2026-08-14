@@ -1,5 +1,9 @@
 # Nhiệm vụ: Kiểm tra quy trình OCR một file ảnh đơn lẻ (samples/images/test.jpg) qua thư viện Ollama, in trực tiếp kết quả Markdown theo thời gian thực (stream) và lưu vào thư mục output/test_result.md.
 
+if __name__ != "__main__":
+    import unittest
+    raise unittest.SkipTest("integration test; run directly with python tests/test_ocr_image.py")
+
 from pathlib import Path
 from time import perf_counter
 

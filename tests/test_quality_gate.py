@@ -69,6 +69,13 @@ class QualityGateTests(unittest.TestCase):
         report = evaluate_page(table, ".")
         self.assertNotIn("missing_vietnamese_diacritics", report.errors)
 
+    def test_table_errors_are_skipped_when_layout_found_no_table(self):
+        malformed = "| a | b |\n| 1 | 2 | 3 |"
+        checked = evaluate_page(malformed, ".", check_tables=True)
+        skipped = evaluate_page(malformed, ".", check_tables=False)
+        self.assertTrue(any(error.startswith("malformed_markdown_table") for error in checked.errors))
+        self.assertFalse(any(error.startswith("malformed_markdown_table") for error in skipped.errors))
+
     def test_missing_page_is_detected(self):
         report = validate_page_numbers([1, 3], 3)
         self.assertIn("missing_pages:2", report.errors)

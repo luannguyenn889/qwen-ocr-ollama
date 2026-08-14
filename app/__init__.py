@@ -1,0 +1,1 @@
+"""Qwen OCR application package."""

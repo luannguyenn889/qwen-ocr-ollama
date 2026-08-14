@@ -22,6 +22,19 @@ class PaddleEngineTests(unittest.TestCase):
         engine._ocr = FakePaddleOCR()
         self.assertEqual(engine.ocr_image("samples/images/01_scan_ro.png"), "dòng trên\ndòng dưới")
 
+    def test_small_y_jitter_is_clustered_before_x_sort(self):
+        engine = PaddleOCREngine()
+        engine._ocr = type("JitteredOCR", (), {"predict": lambda self, _path: [{
+            "rec_texts": ["bên phải", "bên trái", "dòng sau"],
+            "rec_scores": [0.99, 0.99, 0.99],
+            "rec_polys": [
+                [[100, 9], [170, 9], [170, 21], [100, 21]],
+                [[10, 12], [80, 12], [80, 24], [10, 24]],
+                [[10, 40], [90, 40], [90, 52], [10, 52]],
+            ],
+        }]})()
+        self.assertEqual(engine.ocr_image("unused.png"), "bên trái bên phải\ndòng sau")
+
 
 if __name__ == "__main__":
     unittest.main()

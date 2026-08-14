@@ -9,6 +9,13 @@ from app.core.batch_ocr import apply_page_assets, ocr_coordinate_blocks
 
 
 class BlockAssemblerTests(unittest.TestCase):
+    def test_surplus_formula_placeholder_is_removed(self):
+        result = apply_page_assets("Trước formula_placeholder sau", 1, [], [])
+        self.assertNotIn("formula_placeholder", result)
+
+    def test_unplaced_formula_is_preserved(self):
+        result = apply_page_assets("Nội dung", 1, [], ["$x=1$"])
+        self.assertIn("$x=1$", result)
     def test_image_is_inserted_between_coordinate_blocks(self):
         heading = DocumentBlock("heading", (0, 0, 800, 80))
         before = DocumentBlock("text", (0, 100, 800, 250))

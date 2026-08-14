@@ -21,6 +21,36 @@ from PIL import Image, ImageDraw
 BoundingBox = tuple[float, float, float, float]
 
 
+def detect_columns(regions: list[BoundingBox], image_width: int) -> list[tuple[int, int]]:
+    """Compatibility helper: split clearly separated horizontal region groups."""
+    if not regions:
+        return [(0, image_width)]
+    intervals = sorted((box[0], box[2]) for box in regions)
+    merged: list[list[float]] = []
+    for left, right in intervals:
+        if not merged or left > merged[-1][1] + image_width * 0.05:
+            merged.append([left, right])
+        else:
+            merged[-1][1] = max(merged[-1][1], right)
+    if len(merged) <= 1:
+        return [(0, image_width)]
+    boundaries = [0]
+    for current, following in zip(merged, merged[1:]):
+        boundaries.append(min(image_width, int(round((current[1] + following[0]) / 2)) + 2))
+    boundaries.append(image_width)
+    return list(zip(boundaries, boundaries[1:]))
+
+
+@dataclass(frozen=True)
+class PageLayoutAnalysis:
+    segments: list[BoundingBox]
+    blocks: list[tuple[str, BoundingBox]]
+    tables: list[BoundingBox]
+    images: list[BoundingBox]
+    formulas: list[BoundingBox]
+    regions: list[BoundingBox]
+
+
 def _result_data(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
         data = result
@@ -310,9 +340,31 @@ class LayoutDetector:
             band = sum(full[1][3] <= top for full in full_width)
             if width >= page_width * 0.65:
                 return (band, -1, top, left)
-            column = 0 if (left + right) / 2 < page_width / 2 else 1
+            # Quantize by detected horizontal position instead of forcing every
+            # page into two columns. This preserves 3+ uneven columns.
+            column_width = max(page_width * 0.18, 1.0)
+            column = int(left / column_width)
             return (band, column, top, left)
         return sorted(blocks, key=reading_key)
+
+    def analyse_page(self, image_path: str | Path) -> PageLayoutAnalysis:
+        """Run PP-DocLayout once and derive every page-level layout view."""
+        image_bytes = Path(image_path).read_bytes()
+        with Image.open(BytesIO(image_bytes)) as image:
+            width, height = image.width, image.height
+        blocks = self.detect_ordered_blocks(image_bytes)
+        regions = [bbox for _, bbox in blocks]
+        tables = [bbox for kind, bbox in blocks if kind == "table"]
+        images = [bbox for kind, bbox in blocks if kind == "image"]
+        formulas = [bbox for kind, bbox in blocks if kind == "formula"]
+        return PageLayoutAnalysis(
+            segments=detect_reading_segments(regions, width, height),
+            blocks=blocks,
+            tables=tables,
+            images=images,
+            formulas=formulas,
+            regions=regions,
+        )
 
     def detect_layout_tables_and_images(self, image_bytes: bytes) -> tuple[list[BoundingBox], list[BoundingBox]]:
         """Return tables and images bounding boxes respectively."""

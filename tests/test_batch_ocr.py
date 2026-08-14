@@ -274,9 +274,12 @@ class BatchOcrTests(unittest.TestCase):
         
         # Mock layout detector to return a dummy formula box
         mock_detector = MagicMock()
-        mock_detector.analyse.return_value = ([], False)
-        mock_detector.detect_layout_tables_images_and_formulas.return_value = (
-            [], [], [(50.0, 100.0, 150.0, 150.0), (200.0, 200.0, 300.0, 250.0)]
+        from app.core.layout_detector import PageLayoutAnalysis
+        formula_boxes = [(50.0, 100.0, 150.0, 150.0), (200.0, 200.0, 300.0, 250.0)]
+        mock_detector.analyse_page.return_value = PageLayoutAnalysis(
+            segments=[],
+            blocks=[("formula", box) for box in formula_boxes],
+            tables=[], images=[], formulas=formula_boxes, regions=formula_boxes,
         )
         with (
             tempfile.TemporaryDirectory() as temp_dir,
