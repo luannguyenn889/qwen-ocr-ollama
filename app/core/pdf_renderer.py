@@ -12,9 +12,10 @@ import pymupdf
 def render_pdf(
     pdf_path: str | Path,
     output_dir: str | Path,
-    dpi: int = 200,
+    dpi: int = 300,
     page_numbers: set[int] | None = None,
 ):
+
     """Yield ``(one_based_page_number, image_path)`` for selected PDF pages."""
     pdf_path = Path(pdf_path)
     output_dir = Path(output_dir)

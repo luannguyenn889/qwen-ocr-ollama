@@ -8,31 +8,60 @@ env/
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+*.egg-info/
+dist/
+build/
 
-# Logs and outputs
+# Temporary and scratch files
+tmp/
+temp/
+scratch/
+*.tmp
+*.tmp.*
+tmp_*.png
+tmp_*.jpg
+tmp_test_*.png
+
+# Model & framework caches
+.cache/
+.paddlex/
+
+# Output and generated test folders
 logs/
 output/
 OCR/
 PDF/
+scanpdf/
+res/
 OCR_output/
 test_hybrid_out/
 test_output/
 scratch_images/
-.cache/
+layout_debug/
+images/
+
+# Generated image files
 page_*.png
+*_layout.png
 test.*
 *.log
 
 # Environment variables / secrets
 .env
 .env.local
+.env.*.local
 
 # IDE & Editor settings
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-workspace
+*.sublime-project
 
 # OS generated files
 .DS_Store
 Thumbs.db
+ehthumbs.db
+Desktop.ini

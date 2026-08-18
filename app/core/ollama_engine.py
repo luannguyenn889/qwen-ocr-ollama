@@ -14,11 +14,20 @@ from ollama import Client
 OCR_PROMPT = """
 Chuyển đổi hình ảnh trang tài liệu scan này thành định dạng Markdown sạch.
 
+QUY TẮC OCR TUYỆT ĐỐI (ưu tiên cao nhất): Chỉ trích xuất/chép lại chính xác nội dung
+văn bản thực sự nhìn thấy trong ảnh. TUYỆT ĐỐI KHÔNG tự trả lời câu hỏi, giải bài tập,
+viết đoạn văn/bài văn, viết tiếp phần còn thiếu, suy đoán đáp án, tóm tắt, giải thích
+hay bổ sung nội dung mới. Nếu ảnh là đề thi hoặc phiếu câu hỏi, chỉ chép đề và vùng trả
+lời trống. Chỉ xuất đáp án/lời giải khi chính những chữ đó có in rõ trên ảnh hiện tại.
+Nếu chữ không rõ, giữ phần đọc chắc chắn; không dùng ngữ cảnh để tự hoàn thành nội dung.
+
 Hãy tuân thủ các quy tắc định dạng và cấu trúc nghiêm ngặt sau:
 1. Cấu trúc & Bố cục Tài liệu:
    - Nhận diện và định dạng tiêu đề (sử dụng các cấp độ #, ##, ### phù hợp), đoạn văn, danh sách (có thứ tự và không thứ tự), và khối mã (code block).
    - Giữ đúng luồng đọc tự nhiên. Với bố cục nhiều cột, đọc theo từng cột thay vì đọc ngang qua các cột.
    - Tự động phát hiện và loại bỏ các yếu tố nhiễu như tiêu đề đầu trang (headers), chân trang (footers), số trang, và watermark lặp lại.
+   - Mỗi heading và mỗi phương án A., B., C., D. phải nằm trên một dòng riêng. Không ghép nhiều heading/phương án trên cùng dòng và không xuất lệnh `\\hfill`.
+   - Loại cả tên ấn phẩm, hashtag và số thứ tự lặp lại ở mép chân trang.
 
 2. Biểu thức Toán học:
    - Nhận diện toàn bộ ký hiệu, công thức, biến số, chỉ số, và phương trình toán học.
@@ -29,10 +38,13 @@ Hãy tuân thủ các quy tắc định dạng và cấu trúc nghiêm ngặt sa
 3. Bảng biểu & Hình ảnh:
    - Chuyển đổi các bảng biểu đơn giản thành định dạng bảng Markdown tiêu chuẩn.
    - Với các bảng phức tạp (có gộp dòng/gộp cột), sử dụng thẻ HTML `<table>` để biểu diễn chính xác cấu trúc.
-   - Với hình vẽ, sơ đồ hoặc minh họa, biểu diễn bằng thẻ ảnh Markdown: `![Mô tả hình ảnh](image_placeholder.png)`.
+   - Chỉ dùng `image_placeholder` cho ảnh chụp, biểu đồ, logo hoặc hình minh họa chủ yếu là đồ họa.
+   - Hộp văn bản, callout, ghi chú có khung, biểu mẫu và các nút sơ đồ có chữ BẮT BUỘC được chép đầy đủ thành Markdown; tuyệt đối không thay chữ đọc được bằng placeholder ảnh.
+   - Nếu ảnh thật có nhãn hoặc chữ quan trọng, chèn một thẻ ảnh rồi chép phần chữ nhìn thấy ngay bên dưới.
 
 4. Nguyên tắc chung:
    - Giữ nguyên văn bản gốc, bảo toàn ngôn ngữ (tiếng Việt, tiếng Anh, v.v.) và chính tả.
+   - Soi chữ nghệ thuật/font cách điệu theo từng ký tự, đặc biệt là dấu tiếng Việt và các chữ dễ nhầm. Chỉ dùng ngữ cảnh để phân biệt nét chữ thực sự nhìn thấy, không được sáng tác chữ mới.
    - Không tóm tắt, giải thích, hoặc viết thêm lời dẫn giải.
    - Chỉ trả về duy nhất nội dung văn bản Markdown thô. Không bọc kết quả trong các khối mã ```markdown.
 """.strip()

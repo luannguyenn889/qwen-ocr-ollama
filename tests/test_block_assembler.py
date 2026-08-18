@@ -5,10 +5,29 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from app.core.block_assembler import DocumentBlock, assemble_blocks
-from app.core.batch_ocr import apply_page_assets, ocr_coordinate_blocks
+from app.core.batch_ocr import (
+    PROMPT, apply_page_assets, ocr_coordinate_blocks,
+    retain_extracted_image_blocks,
+)
 
 
 class BlockAssemblerTests(unittest.TestCase):
+    def test_filtered_graphic_block_cannot_suppress_overlapping_text(self):
+        text = ("text", (10.0, 10.0, 90.0, 30.0))
+        rejected_stamp = ("image", (0.0, 0.0, 100.0, 100.0))
+        kept_figure = ("image", (0.0, 120.0, 100.0, 220.0))
+
+        result = retain_extracted_image_blocks(
+            [text, rejected_stamp, kept_figure], [kept_figure[1]]
+        )
+
+        self.assertEqual(result, [text, kept_figure])
+
+    def test_core_prompt_prioritizes_text_over_graphic_layout_labels(self):
+        self.assertIn("Never let an `image`, `figure`, `seal`", PROMPT)
+        self.assertIn("regardless of the\n     document type", PROMPT)
+        self.assertIn("signature or stamp by default", PROMPT)
+
     def test_surplus_formula_placeholder_is_removed(self):
         result = apply_page_assets("Trước formula_placeholder sau", 1, [], [])
         self.assertNotIn("formula_placeholder", result)
@@ -60,6 +79,27 @@ class BlockAssemblerTests(unittest.TestCase):
         self.assertLess(markdown.index("Đoạn trước"), markdown.index("images/figure.png"))
         self.assertLess(markdown.index("images/figure.png"), markdown.index("Đoạn sau"))
 
+    def test_coordinate_ocr_does_not_insert_unrequested_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page = root / "page.png"
+            from PIL import Image
+            Image.new("RGB", (100, 100), "white").save(page)
+            client = Mock()
+            client.generate.return_value = [SimpleNamespace(response="Nội dung")]
+            markdown = ocr_coordinate_blocks(
+                client, "model", page,
+                [("text", (0, 0, 100, 40)), ("image", (0, 50, 100, 100))],
+                ["images/figure.png"], root / "blocks", page_number=3,
+            )
+        self.assertNotIn("images/figure.png", markdown)
+
+    def test_model_zero_based_generic_alt_is_corrected(self):
+        result = apply_page_assets(
+            "![Hình ảnh trang 0](image_placeholder.png)", 4, ["images/figure.png"]
+        )
+        self.assertIn("![Hình ảnh trang 4]", result)
+
     def test_already_positioned_image_is_not_appended_twice(self):
         markdown = "Trước\n\n![Hình](images/figure.png)\n\nSau"
         result = apply_page_assets(markdown, 1, ["images/figure.png"])
@@ -96,7 +136,7 @@ class BlockAssemblerTests(unittest.TestCase):
         result = apply_page_assets(markdown, 1, ["images/new.png"])
         self.assertIn("images/existing.png", result)
         self.assertIn("https://example.com/photo.png", result)
-        self.assertEqual(result.count("images/new.png"), 1)
+        self.assertNotIn("images/new.png", result)
 
 
 if __name__ == "__main__":

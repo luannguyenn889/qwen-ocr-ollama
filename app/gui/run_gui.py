@@ -36,11 +36,13 @@ from app.core.batch_ocr import (
     ENABLE_LAYOUT_DETECTION, MODEL, PROMPT as CORE_PROMPT,
     TABLE_HTML_RETRY_INSTRUCTION, TABLE_RENDER_DPI, TABLE_SAFE_INSTRUCTION,
     TABLE_STRUCTURE_REPAIR_PROMPT, clean_markdown as core_clean_markdown,
-    QUALITY_RETRY_INSTRUCTION, apply_page_assets,
+    TEXT_ONLY_OUTPUT,
+    QUALITY_RETRY_INSTRUCTION, apply_page_assets, cleanup_unreferenced_assets, quality_retry_instruction,
     extract_images_from_page as core_extract_images_from_page,
-    finalize_markdown, link_extracted_images,
+    finalize_markdown, format_finalization_report, link_extracted_images,
     needs_table_retry, normalize_worker_count, render_table_page, resolve_qwen_model,
-    ocr_coordinate_blocks, ocr_qwen_images, PipelineCancelled,
+    normalized_document_stem, ocr_coordinate_blocks, ocr_qwen_images,
+    output_markdown_path, PipelineCancelled, retain_extracted_image_blocks,
 )
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -253,10 +255,16 @@ class OCRWorker:
         self.model_name = model_name
         self.client = Client(host="http://localhost:11434")
 
+    def _before_qwen_request(self):
+        """Wait while paused and abort cleanly when the user cancels."""
+        self.resume_event.wait()
+        if self.stop_event.is_set():
+            raise PipelineCancelled()
+
     def run(self):
         batch_start_time = time.perf_counter()
         try:
-            # 1. Collect PDFs
+            # 1. Thu thập danh sách tệp PDF
             pdf_files = []
             if self.target_path.is_file() and self.target_path.suffix.lower() == ".pdf":
                 pdf_files.append(self.target_path)
@@ -283,15 +291,15 @@ class OCRWorker:
                 self.progress_queue.put(("file_progress", (file_idx, total_files, pdf_path.name)))
                 self.progress_queue.put(("log", f"\n[File {file_idx}/{total_files}] Đang xử lý: {pdf_path.name}\n"))
                 
-                # Create output folder
+                # Tạo thư mục đầu ra
                 self.output_dir.mkdir(parents=True, exist_ok=True)
-                output_path = self.output_dir / f"{pdf_path.stem}.md"
+                output_path = output_markdown_path(self.output_dir, pdf_path)
                 
-                # Render pages
+                # Render các trang PDF thành ảnh
                 with tempfile.TemporaryDirectory() as temp_dir:
                     temp_dir_path = Path(temp_dir)
                     
-                    self.progress_queue.put(("log", "  - Đang render PDF thành hình ảnh...\n"))
+                    self.progress_queue.put(("log", "  - Đang render PDF thành hình ảnh (300 DPI)...\n"))
                     doc = pymupdf.open(pdf_path)
                     total_pages = len(doc)
                     
@@ -302,7 +310,7 @@ class OCRWorker:
                             break
                         render_started_at = time.perf_counter()
                         page = doc.load_page(idx)
-                        pix = page.get_pixmap(dpi=200, colorspace=pymupdf.csRGB, alpha=False)
+                        pix = page.get_pixmap(dpi=300, colorspace=pymupdf.csRGB, alpha=False)
                         img_path = temp_dir_path / f"page_{idx + 1}.png"
                         pix.save(str(img_path))
                         page_images.append(img_path)
@@ -312,7 +320,7 @@ class OCRWorker:
                     if self.stop_event.is_set():
                         break
 
-                    # OCR each page
+                    # OCR từng trang
                     ocr_contents = []
                     is_hybrid = "hybrid" in self.model_name.lower()
                     hybrid_model = resolve_qwen_model(self.model_name)
@@ -360,14 +368,10 @@ class OCRWorker:
                                 from app.core.layout_detector import save_layout_overlay
                                 overlay_path = save_layout_overlay(
                                     img_path,
-                                    self.output_dir / "layout_debug" / f"{pdf_path.stem}_page_{page_num}_layout.png",
+                                    temp_dir_path / "layout_debug" / f"{normalized_document_stem(pdf_path)}_page_{page_num}_layout.png",
                                     text_regions, columns, table_regions,
                                 )
                                 self.progress_queue.put(("layout_overlay", overlay_path))
-                                if len(columns) >= 2:
-                                    from app.core.layout_detector import crop_segments
-                                    qwen_images = crop_segments(img_path, columns, temp_dir_path / "columns")
-                                    self.progress_queue.put(("log", f"    -> Phát hiện {len(qwen_images)} cột, đọc từ trái sang phải.\n"))
                                 if has_table:
                                     qwen_images = [render_table_page(pdf_path, idx, temp_dir_path / "table_pages")]
                                     self.progress_queue.put(("log", f"    -> Phát hiện bảng, render lại {TABLE_RENDER_DPI} DPI trước khi gửi Qwen.\n"))
@@ -377,31 +381,38 @@ class OCRWorker:
                                 ordered_blocks = []
 
                         try:
+                            if TEXT_ONLY_OUTPUT:
+                                if page_analysis is not None:
+                                    page_analysis.images.clear()
+                                raise StopIteration
                             output_img_dir = self.output_dir / "images"
                             extracted_paths = extract_images_from_page(
-                                pdf_path, idx, output_img_dir, pdf_path.stem,
+                                pdf_path, idx, output_img_dir, normalized_document_stem(pdf_path),
                                 layout_detector=layout_detector,
                                 page_image_path=img_path,
                                 segments=page_analysis.segments if page_analysis else None,
                                 detected_images=page_analysis.images if page_analysis else [],
                             )
+                        except StopIteration:
+                            pass
                         except Exception as img_err:
                             self.progress_queue.put(("log", f"    -> [Chú ý] Không thể trích xuất ảnh: {img_err}\n"))
 
-                        qwen_started_at = time.perf_counter()
+                        if page_analysis is not None:
+                            ordered_blocks = retain_extracted_image_blocks(
+                                ordered_blocks, page_analysis.images
+                            )
 
-                        def before_qwen_request():
-                            self.resume_event.wait()
-                            if self.stop_event.is_set():
-                                raise PipelineCancelled()
+                        qwen_started_at = time.perf_counter()
 
                         try:
                             selected_model = hybrid_model if is_hybrid else resolve_qwen_model(self.model_name)
                             page_md = ocr_coordinate_blocks(
                                 self.client, selected_model, img_path, ordered_blocks, extracted_paths,
                                 temp_dir_path / "layout_blocks" / f"page_{page_num}",
+                                page_number=page_num,
                                 log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
-                                before_request=before_qwen_request,
+                                before_request=self._before_qwen_request,
                             )
                             if page_md is not None:
                                 self.progress_queue.put(("log", "    -> Đã OCR toàn trang một lần và đặt ảnh theo reading order.\n"))
@@ -409,7 +420,7 @@ class OCRWorker:
                                 page_md = ocr_qwen_images(
                                     self.client, selected_model, qwen_images, has_table=has_table,
                                     log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
-                                    before_request=before_qwen_request,
+                                    before_request=self._before_qwen_request,
                                 )
                         except PipelineCancelled:
                             return None
@@ -422,11 +433,14 @@ class OCRWorker:
 
                         from app.core.quality_gate import choose_best_page, evaluate_page
                         quality = evaluate_page(page_md, self.output_dir, check_tables=has_table)
+                        errors_str = f"Lỗi: {', '.join(quality.errors)}" if quality.errors else "Không có lỗi"
+                        warnings_str = f", Cảnh báo: {', '.join(quality.warnings)}" if quality.warnings else ""
+                        self.progress_queue.put(("log", f"    -> [Quality Gate Trang {page_num}] Điểm chất lượng: {quality.score}/100.0 ({errors_str}{warnings_str})\n"))
                         if quality.warnings:
                             self.progress_queue.put(("log", f"    -> [Cảnh báo] Trang {page_num}: {', '.join(quality.warnings)}\n"))
-                        if not quality.passed:
+                        if quality.should_retry:
                             initial_md, initial_quality = page_md, quality
-                            self.progress_queue.put(("log", f"    -> Quality retry trang {page_num}: {', '.join(quality.errors)}\n"))
+                            self.progress_queue.put(("log", f"    -> Quality retry trang {page_num} (Điểm: {quality.score}/100 < ngưỡng hoặc có lỗi nghiêm trọng): {', '.join(quality.errors)}\n"))
                             retry_started_at = time.perf_counter()
                             try:
                                 retry_md = ocr_qwen_images(
@@ -434,10 +448,11 @@ class OCRWorker:
                                     hybrid_model if is_hybrid else resolve_qwen_model(self.model_name),
                                     [img_path],
                                     has_table=has_table,
-                                    extra_instruction="\n\n" + QUALITY_RETRY_INSTRUCTION.format(errors=", ".join(quality.errors)),
+                                    extra_instruction="\n\n" + quality_retry_instruction(initial_md, ", ".join(quality.errors)),
                                     log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
-                                    before_request=before_qwen_request,
+                                    before_request=self._before_qwen_request,
                                 )
+
                             except PipelineCancelled:
                                 return None
                             except Exception as retry_error:
@@ -446,6 +461,9 @@ class OCRWorker:
                             else:
                                 retry_md = apply_page_assets(retry_md, page_num, extracted_paths)
                                 retry_quality = evaluate_page(retry_md, self.output_dir, check_tables=has_table)
+                                retry_errors_str = f"Lỗi: {', '.join(retry_quality.errors)}" if retry_quality.errors else "Không có lỗi"
+                                retry_warnings_str = f", Cảnh báo: {', '.join(retry_quality.warnings)}" if retry_quality.warnings else ""
+                                self.progress_queue.put(("log", f"    -> [Quality Gate Retry Trang {page_num}] Điểm sau retry: {retry_quality.score}/100.0 ({retry_errors_str}{retry_warnings_str})\n"))
                                 if retry_quality.warnings:
                                     self.progress_queue.put(("log", f"    -> [Cảnh báo] Retry trang {page_num}: {', '.join(retry_quality.warnings)}\n"))
                                 page_md, quality = choose_best_page(
@@ -455,9 +473,16 @@ class OCRWorker:
                             if not quality.passed:
                                 self.progress_queue.put((
                                     "log",
-                                    f"    -> [Cảnh báo] Trang {page_num} vẫn chưa đạt quality gate "
+                                    f"    -> [Cảnh báo] Trang {page_num} (Điểm: {quality.score}/100) "
                                     f"({', '.join(quality.errors)}); dùng kết quả tốt nhất và tiếp tục.\n",
                                 ))
+
+                        removed_assets = cleanup_unreferenced_assets(page_md, extracted_paths, self.output_dir)
+                        if removed_assets:
+                            self.progress_queue.put((
+                                "log",
+                                f"    -> Đã xóa {removed_assets} ảnh trích xuất không được tham chiếu ở trang {page_num}.\n",
+                            ))
 
                         qwen_seconds = time.perf_counter() - qwen_started_at
                         elapsed = time.perf_counter() - started_at
@@ -500,6 +525,24 @@ class OCRWorker:
                                 results.append(res)
                     
                     results.sort(key=lambda x: x[0])
+                    from app.core.image_grounded_review import review_suspicious_lines
+                    reviewed_results = []
+                    for page_num, page_md in results:
+                        try:
+                            page_md = review_suspicious_lines(
+                                self.client, resolve_qwen_model(self.model_name),
+                                page_images[page_num - 1], page_md,
+                                temp_dir_path / "review_crops" / f"page_{page_num}",
+                                log_func=lambda message, number=page_num: self.progress_queue.put(("log", f"    -> [Trang {number}] {message}\n")),
+                                before_request=self._before_qwen_request,
+                                review_document_footer=page_num == total_pages,
+                            )
+                        except PipelineCancelled:
+                            return None
+                        except Exception as review_error:
+                            self.progress_queue.put(("log", f"    -> [Cảnh báo] Kiểm tra ảnh trang {page_num} thất bại; giữ OCR ban đầu: {review_error}\n"))
+                        reviewed_results.append((page_num, page_md))
+                    results = reviewed_results
                     from app.core.quality_gate import validate_page_numbers
                     page_quality = validate_page_numbers([page_num for page_num, _ in results], total_pages)
                     if not page_quality.passed and not self.stop_event.is_set():
@@ -513,8 +556,12 @@ class OCRWorker:
                         
                     # Save results
                     final_md = "\n\n".join(ocr_contents) + "\n"
+                    finalization_report = {"spelling_warnings": []}
                     try:
-                        final_md = finalize_markdown(final_md)
+                        final_md, finalization_report = finalize_markdown(final_md, return_report=True)
+                        self.progress_queue.put(("log", "  - Hậu xử lý Markdown:\n"))
+                        for report_line in format_finalization_report(finalization_report):
+                            self.progress_queue.put(("log", f"    + {report_line}\n"))
                     except Exception as pp_err:
                         self.progress_queue.put(("log", f"    -> [Chú ý] Không thể hoàn thiện Markdown: {pp_err}\n"))
                     temp_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
@@ -658,6 +705,7 @@ class AppGUI:
         self.workers_var = tk.IntVar(value=1)
         workers_spin = ttk.Spinbox(model_frame, from_=1, to=2, textvariable=self.workers_var, width=5, font=("Segoe UI", 10))
         workers_spin.pack(side=tk.LEFT)
+
 
         # 4. Status & Progress Indicators
         progress_frame = ttk.LabelFrame(main_frame, text=" Tiến trình ", padding=10)
@@ -953,7 +1001,11 @@ class AppGUI:
         resolved_model = resolve_qwen_model(model_name)
         if resolved_model != model_name:
             self.log_text.insert(tk.END, f"Dùng Ollama model: {resolved_model}\n")
-        worker = OCRWorker(target_path, Path(output), self.progress_queue, self.stop_event, self.resume_event, model_name, workers=self.workers_var.get() if hasattr(self, 'workers_var') else 1)
+        worker = OCRWorker(
+            target_path, Path(output), self.progress_queue, self.stop_event,
+            self.resume_event, model_name,
+            workers=self.workers_var.get() if hasattr(self, 'workers_var') else 1,
+        )
         self.worker_thread = threading.Thread(target=worker.run, daemon=True)
         self.worker_thread.start()
 

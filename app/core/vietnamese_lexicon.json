@@ -1,0 +1,28 @@
+{
+  "words": [
+    "báo", "cáo", "công", "cứu", "dữ", "học", "khoa", "liệu", "máy",
+    "nghiên", "nghệ", "phát", "thông", "triển", "trí", "tuệ"
+  ],
+  "accent_candidates": {
+    "bao": ["báo", "bảo", "bao"],
+    "cao": ["cáo", "cao"],
+    "cong": ["công", "cộng", "cong"],
+    "cuu": ["cứu", "cừu", "cựu", "cửu"],
+    "du": ["dữ", "đủ", "dự"],
+    "hoc": ["học", "hóc"],
+    "khoa": ["khoa", "khóa"],
+    "lieu": ["liệu", "liêu"],
+    "may": ["máy", "may", "mây"],
+    "nghien": ["nghiên", "nghiện"],
+    "nghe": ["nghệ", "nghe", "nghề"],
+    "phat": ["phát", "phạt"],
+    "thong": ["thông", "thống"],
+    "trien": ["triển", "triền"],
+    "tri": ["trí", "trị", "tri"],
+    "tue": ["tuệ"]
+  },
+  "bigrams": [
+    "báo cáo", "công nghệ", "dữ liệu", "khoa học", "máy học",
+    "nghiên cứu", "phát triển", "thông tin", "trí tuệ"
+  ]
+}

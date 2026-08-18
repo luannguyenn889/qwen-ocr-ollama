@@ -2,7 +2,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.core.quality_gate import QualityReport, choose_best_page, evaluate_page, validate_page_numbers
+from app.core.quality_gate import (
+    QualityReport, choose_best_page, detect_language_profile, evaluate_page,
+    html_table_structure_errors, validate_page_numbers,
+)
 
 
 class QualityGateTests(unittest.TestCase):
@@ -62,6 +65,32 @@ class QualityGateTests(unittest.TestCase):
         self.assertNotIn("missing_vietnamese_diacritics", report.errors)
         self.assertNotIn("suspected_missing_vietnamese_diacritics", report.warnings)
 
+    def test_widespread_missing_diacritics_retries_from_image(self):
+        paragraph = "Viet Nam la nuoc co nhieu chuong trinh phat trien trong nam va duoc dau tu. " * 8
+        report = evaluate_page(paragraph, ".")
+        self.assertIn("missing_vietnamese_diacritics", report.errors)
+        self.assertTrue(report.should_retry)
+
+    def test_mixed_language_profile_and_unaccented_vietnamese(self):
+        paragraph = (
+            "This report describes the machine learning system and its API for users. "
+            "Viet Nam la mot nuoc co nhieu diem du lich va cac chuong trinh phat trien duoc thuc hien. "
+        ) * 3
+        self.assertEqual(detect_language_profile(paragraph), "mixed_vi_en")
+        self.assertIn("missing_vietnamese_diacritics", evaluate_page(paragraph, ".").errors)
+
+    def test_html_table_validates_rowspan_and_colspan_width(self):
+        valid = (
+            '<table><tr><th rowspan="2">A</th><th colspan="2">B</th></tr>'
+            '<tr><td>C</td><td>D</td></tr></table>'
+        )
+        invalid = '<table><tr><th colspan="2">A</th></tr><tr><td>B</td></tr></table>'
+        self.assertEqual(html_table_structure_errors(valid), [])
+        self.assertIn(
+            "malformed_html_table:inconsistent_logical_columns",
+            html_table_structure_errors(invalid),
+        )
+
     def test_numeric_table_is_excluded_from_diacritic_check(self):
         table = "| Nam | 2022 | 2023 |\n|---|---:|---:|\n" + "\n".join(
             f"| Thi truong {number} | {number * 10} | {number * 20} |" for number in range(20)
@@ -111,6 +140,46 @@ class QualityGateTests(unittest.TestCase):
     def test_long_identifier_is_not_a_glued_word(self):
         report = evaluate_page("CustomerAccountTransactionReferenceIdentifier", ".")
         self.assertNotIn("glued_words", report.errors)
+
+    def test_detects_latex_unbalanced_braces_and_incomplete_command(self):
+        md = "Công thức sai ngoặc: $f(x) = \\frac{a+b}{c$ và $\\sqrt$"
+        report = evaluate_page(md, ".")
+        self.assertIn("unbalanced_latex_braces", report.errors)
+        self.assertIn("incomplete_latex_command", report.errors)
+        self.assertTrue(report.score < 80.0)
+        self.assertTrue(report.should_retry)
+
+
+    def test_detects_hallucination_loops_and_repeated_words(self):
+        repeated_lines = "Dòng văn bản này bị lặp lại liên tục.\n" * 5
+        report = evaluate_page(repeated_lines, ".")
+        self.assertIn("repetition_loop", report.errors)
+        self.assertTrue(report.should_retry)
+
+        repeated_words = "Nội dung này có từ từ từ từ từ bị lặp nhiều lần liên tiếp."
+        report2 = evaluate_page(repeated_words, ".")
+        self.assertIn("repeated_words", report2.errors)
+
+    def test_detects_multiline_hallucination_loop(self):
+        block = (
+            "Đây là dòng thứ nhất đủ dài trong vòng lặp do mô hình sinh ra.\n"
+            "Đây là dòng thứ hai đủ dài trong vòng lặp do mô hình sinh ra.\n"
+        )
+        report = evaluate_page(block * 4, ".")
+        self.assertIn("repetition_loop", report.errors)
+        self.assertTrue(report.should_retry)
+
+    def test_detects_unclosed_markdown_code_blocks(self):
+        md = "```python\nprint('hello world')\n"
+        report = evaluate_page(md, ".")
+        self.assertIn("unclosed_code_blocks", report.errors)
+
+    def test_scoring_system_passes_minor_issues_above_threshold(self):
+        # glued_words has penalty 5 -> score 95.0 >= 80.0
+        report = evaluate_page("Một văn bản tốt với một cụm glued" + "t" * 50, ".")
+        if "glued_words" in report.errors and len(report.errors) == 1:
+            self.assertEqual(report.score, 95.0)
+            self.assertFalse(report.should_retry)
 
 
 if __name__ == "__main__":

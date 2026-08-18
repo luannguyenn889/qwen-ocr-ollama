@@ -7,16 +7,11 @@ import sys
 from pathlib import Path
 from time import perf_counter
 from ollama import Client
+from app.core.ollama_engine import OCR_PROMPT
 
 MODEL = "qwen3.5:4b"
 
-PROMPT = """
-Convert scanned document to Markdown.
-Preserve all text.
-Use LaTeX for formulas.
-Do not summarize.
-Return Markdown only.
-""".strip()
+PROMPT = OCR_PROMPT
 
 # Hàm main điều khiển tiến trình nhận diện hình ảnh đơn
 def main():
@@ -65,4 +60,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

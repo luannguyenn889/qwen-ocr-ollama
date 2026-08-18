@@ -23,6 +23,7 @@ from app.core.pdf_renderer import (
     render_pdf,
 )
 from app.core.pdf_text_layer import extract_native_text
+from app.core.batch_ocr import finalize_markdown, output_markdown_path
 
 
 # Hàm chính điều phối quá trình xử lý OCR cho toàn bộ file PDF
@@ -58,15 +59,8 @@ def ocr_pdf(
     )
 
     # Xác định đường dẫn file đích và file tạm
-    final_path = (
-        output_dir
-        / f"{pdf_path.stem}.md"
-    )
-
-    temp_path = (
-        output_dir
-        / f"{pdf_path.stem}.md.tmp"
-    )
+    final_path = output_markdown_path(output_dir, pdf_path)
+    temp_path = final_path.with_suffix(final_path.suffix + ".tmp")
 
     print(f"[1/3] PDF đầu vào: {pdf_path}", flush=True)
     print(f"      Kích thước: {pdf_path.stat().st_size:,} bytes", flush=True)
@@ -102,43 +96,32 @@ def ocr_pdf(
     # Sử dụng thư mục tạm để lưu ảnh render trước khi OCR
     with tempfile.TemporaryDirectory() as temp_images:
 
-        with temp_path.open(
-            "w",
-            encoding="utf-8",
-        ) as output_file:
+        # Render các trang cần OCR thành ảnh
+        rendered_pages = dict(render_pdf(
+            pdf_path, temp_images, dpi=dpi, page_numbers=ocr_page_numbers,
+        ))
+        document_parts: list[str] = []
 
-            # Render các trang cần OCR thành ảnh
-            rendered_pages = dict(render_pdf(
-                pdf_path, temp_images, dpi=dpi, page_numbers=ocr_page_numbers,
-            ))
-            
-            # Duyệt qua từng trang để ghép nội dung từ text layer hoặc OCR
-            for page_number in range(1, len(native_pages) + len(ocr_page_numbers) + 1):
-                if page_number in native_pages:
-                    markdown = native_pages[page_number]
-                    source = "native-text"
-                    print(f"[Trang {page_number}] Dùng text layer PDF; bỏ qua OCR.", flush=True)
-                else:
-                    image_path = rendered_pages[page_number]
-                    print(f"[Trang {page_number}] Đã render ảnh, đang OCR bằng Ollama...", flush=True)
-                    page_started_at = perf_counter()
-                    markdown = engine.ocr_image(image_path)
-                    page_elapsed = perf_counter() - page_started_at
-                    source = "ocr"
-                    print(f"[Trang {page_number}] Hoàn tất OCR trong {page_elapsed:.1f} giây.", flush=True)
+        # Duyệt qua từng trang để ghép nội dung từ text layer hoặc OCR
+        for page_number in range(1, len(native_pages) + len(ocr_page_numbers) + 1):
+            if page_number in native_pages:
+                markdown = native_pages[page_number]
+                source = "native-text"
+                print(f"[Trang {page_number}] Dùng text layer PDF; bỏ qua OCR.", flush=True)
+            else:
+                image_path = rendered_pages[page_number]
+                print(f"[Trang {page_number}] Đã render ảnh, đang OCR bằng Ollama...", flush=True)
+                page_started_at = perf_counter()
+                markdown = engine.ocr_image(image_path)
+                page_elapsed = perf_counter() - page_started_at
+                source = "ocr"
+                print(f"[Trang {page_number}] Hoàn tất OCR trong {page_elapsed:.1f} giây.", flush=True)
+            document_parts.append(
+                f"<!-- Trang {page_number}; nguồn: {source} -->\n\n{markdown}"
+            )
 
-                # Ghi chú nguồn gốc nội dung trang
-                output_file.write(
-                    f"\n\n<!-- Trang {page_number}; nguồn: {source} -->\n\n"
-                )
-
-                output_file.write(
-                    markdown
-                )
-
-                output_file.write(
-                    "\n"
-                )
+        finalized = finalize_markdown("\n\n".join(document_parts)) + "\n"
+        temp_path.write_text(finalized, encoding="utf-8")
 
     # Hoàn tất: đổi tên file tạm thành file chính thức
     os.replace(

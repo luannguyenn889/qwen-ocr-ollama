@@ -12,31 +12,9 @@ from pathlib import Path
 from time import perf_counter
 # pyrefly: ignore [missing-import]
 from ollama import Client
+from app.core.batch_ocr import PROMPT
 
 MODEL = "qwen3.5:4b"
-
-PROMPT = """
-Convert this scanned document to Markdown format according to the following requirements:
-
-1. Remove unnecessary elements:
-   - Automatically detect and remove headers, footers, footnotes, and page numbers to make the content cleaner and clearer.
-
-2. Preserve the original document structure and layout:
-   - Maintain heading hierarchies (Heading #, ##, ###, ####), paragraphs, and lists (bulleted/numbered lists).
-   - CRITICAL: All question headers (e.g., "Câu 1.", "Câu 2.", "Câu 10.") must be strictly formatted as Heading Level 4: `#### Câu X.`. Do not use bold tags (`**Câu X.**`) or normal text for question headers.
-   - Ensure the correct natural reading order of the document. For multi-column layouts or multiple-choice questions side-by-side, read column-by-column and keep the options (A, B, C, D) associated with their correct question. Do not merge text across columns.
-
-3. Recognize special components:
-   - Mathematical expressions: Automatically convert all formulas, variables, subscripts (e.g., S_1 to $S_1$), primes (e.g., A' to $A'$), fractions (always use \\frac{num}{den} for vertical fractions), and math symbols into LaTeX format. Use $...$ for inline formulas and $$...$$ for block formulas. Do not repeat characters or duplicate terms.
-      * CRITICAL: Never use HTML space entities (such as &nbsp; or &amp;nbsp;) anywhere in the document. Use standard markdown spaces or newlines to separate options. Each mathematical expression must have its own closed pair of dollar signs ($). Never group non-mathematical text, punctuation, labels (like 'B.', 'C.', 'D.') inside a dollar sign pair.
-   - Tables: Extract tables accurately. For complex tables (with merged cells or multi-tiered headers), export them as HTML tables (<table>). For simple tables, use the standard Markdown table format.
-   - Images and captions: If images or diagrams are detected, represent them as a Markdown image tag with the description inside the square brackets and a placeholder path inside the parentheses, for example: `![Description of the image/diagram](image_placeholder.png)`. Never put descriptive text inside the parentheses.
-
-4. General requirements:
-   - Do not summarize the content, keep both Vietnamese and English text exactly as written.
-   - Return only the raw Markdown content, do not wrap it inside ```markdown code blocks.
-""".strip()
-
 
 # Hàm làm sạch sơ bộ văn bản Markdown đầu ra
 def clean_markdown(text: str) -> str:
@@ -129,4 +107,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

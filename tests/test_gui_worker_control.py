@@ -35,6 +35,20 @@ class GuiWorkerControlTests(unittest.TestCase):
         )
         self.assertEqual(worker.workers, 2)
 
+    def test_shared_qwen_request_guard_honors_cancellation(self):
+        stop_event = threading.Event()
+        resume_event = threading.Event()
+        resume_event.set()
+        worker = OCRWorker(
+            Path("input.pdf"), Path("output"), queue.Queue(),
+            stop_event, resume_event, "qwen3.5:4b",
+        )
+
+        worker._before_qwen_request()
+        stop_event.set()
+        with self.assertRaises(batch_ocr.PipelineCancelled):
+            worker._before_qwen_request()
+
     def test_hybrid_label_resolves_to_qwen_model(self):
         self.assertEqual(
             batch_ocr.resolve_qwen_model("Hybrid (Paddle layout + qwen3.5:4b)"),

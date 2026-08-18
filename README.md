@@ -1,20 +1,21 @@
 # Qwen OCR & Ollama Project
 
-Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** chạy local thông qua **Ollama** để nhận diện ký tự quang học (OCR) tài liệu tiếng Việt dạng hình ảnh và PDF sang định dạng Markdown chuẩn, hỗ trợ dịch công thức toán học (LaTeX) và trích xuất hình vẽ (diagram).
+Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** để OCR tài liệu PDF thành Markdown sạch. Lõi OCR không phụ thuộc loại tài liệu; các quy tắc chuyên ngành chỉ được dùng để chọn vùng cần Qwen đọc lại từ ảnh và không trực tiếp sửa nội dung.
 
 ---
 
 ## 🌟 Các tính năng nổi bật (Mới cập nhật)
 
-1. **Trích xuất hình vẽ & Tự động liên kết (Real Image Extraction)**:
-   * Tự động quét và trích xuất tất cả các tệp hình ảnh, sơ đồ hình học, biểu đồ thực tế từ tệp PDF gốc lưu vào thư mục `images/`.
-   * Tự động thay thế đường dẫn giả lập thành đường dẫn tệp tin thực tế trong file Markdown kết quả để hiển thị trực tiếp sơ đồ lên tài liệu Markdown.
+1. **Đầu ra Markdown sạch có ảnh nội dung**:
+   * Mỗi tài liệu tạo một file `<tên-tài-liệu>.md`; ảnh nội dung thực sự được lưu trong thư mục `images/` và liên kết từ Markdown.
+   * Crop hậu kiểm, overlay layout và nhật ký hiệu chỉnh chỉ tồn tại tạm thời rồi được xoá.
+   * Không chèn ảnh chữ ký/con dấu; chữ in đọc được xung quanh vẫn được giữ.
 2. **Gộp bảng thông minh qua ranh giới trang (Smart Table Merger)**:
    * Tự động phát hiện và gộp các bảng Markdown bị phân cắt qua ranh giới trang (ví dụ bảng kéo dài từ trang trước sang trang sau).
    * Loại bỏ các dòng tiêu đề trùng lặp và khoảng trắng thừa, hợp nhất dữ liệu thành một bảng lớn duy nhất chuẩn Markdown.
-3. **Độ phân giải & Tăng cường hình ảnh**:
-   * Render trang thường ở **150 DPI (CLI)** hoặc **200 DPI (GUI)**; trang có bảng được render lại ở **300 DPI**.
-   * Tiền xử lý tăng cường độ tương phản (Contrast Enhancement) giúp làm sắc nét nét chữ, tăng độ chính xác nhận dạng đối với các ký tự toán học nhỏ.
+3. **Render và công thức**:
+   * CLI và GUI render trang OCR ở **300 DPI**; trang có bảng luôn dùng ảnh toàn trang để giữ cấu trúc hàng/cột.
+   * LaTeX-OCR là thành phần tùy chọn; khi không khả dụng, Qwen tiếp tục nhận dạng công thức.
 4. **Giao diện GUI chuyên nghiệp (Tkinter)**:
    * **Bất đồng bộ hoàn toàn (Multi-threading)**: Chạy tiến trình OCR trên luồng riêng biệt, không gây treo ứng dụng.
    * **Tiến trình 2 cấp độ (Dual Progress Bars)**: 2 thanh tiến trình trực quan hiển thị song song (Thanh 1: Tiến trình tổng số file; Thanh 2: Tiến trình số trang của file hiện tại).
@@ -27,6 +28,13 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
 6. **Theo dõi hiệu năng trong log**:
    * Hiển thị thời gian render, phân tích Paddle và Qwen theo từng trang.
    * GUI ghi tổng thời gian từng file và toàn bộ đợt OCR khi hoàn tất.
+7. **Hậu kiểm dựa trên ảnh**:
+   * Bộ kiểm tra chỉ đề cử dòng nghi ngờ: ngày/số hiệu bất thường, mất dấu diện rộng, ký tự dính, dấu câu có thể do nét bút và khối người ký có nguy cơ thiếu.
+   * Dòng nghi ngờ được crop cùng vùng trước/sau rồi gửi Qwen đọc lại. Chỉ áp dụng thay đổi khi ảnh xác nhận rõ và độ tin cậy đạt tối thiểu `0.98`.
+   * Không tự sửa lỗi chính tả vốn được in trên tài liệu. Nếu không chắc chắn, hệ thống giữ kết quả OCR đầu tiên.
+8. **Phân loại chuyên ngành có kiểm soát**:
+   * Không dùng danh sách từ khóa để ép tài liệu vào một loại cố định.
+   * Vùng cuối trang cuối được hậu kiểm cho mọi loại tài liệu, gồm công văn, hợp đồng, biên bản, chứng nhận và biểu mẫu.
 
 ---
 
@@ -52,7 +60,7 @@ Dự án sử dụng mô hình thị giác (Vision Language Model) **Qwen** ch�
 
 ## II. Luồng xử lý chính (Core Pipeline)
 
-Hệ thống xử lý từng file PDF qua luồng đa bước (pipeline) tự động để đảm bảo cấu trúc, bảng biểu, công thức toán và hình ảnh được giữ nguyên vẹn nhất:
+Hệ thống xử lý từng PDF qua pipeline OCR tổng quát và hậu kiểm có đối chiếu ảnh:
 
 ```mermaid
 graph TD
@@ -64,30 +72,40 @@ graph TD
     D --> G
     E --> G
     F --> G
-    G[3. Trích xuất Hình ảnh & Công thức Toán]
-    G --> H[4. Nhận diện OCR bằng AI<br/>Qwen VLM]
+    G[3. Nhận diện công thức tùy chọn]
+    G --> H[4. OCR toàn trang<br/>Qwen VLM]
     H --> I{Kiểm tra Bảng bị vỡ?}
     I -->|Có lỗi| J[5. Retry: Bắt buộc dùng HTML Table]
-    I -->|Hợp lệ| K[6. Lắp ráp & Hoàn thiện]
+    I -->|Hợp lệ| K[6. Quality Gate]
     J --> K
-    K --> L[Nối bảng bị đứt giữa 2 trang]
-    L --> M[7. Xuất Kết quả<br/>Markdown]
+    K --> L[7. Phân loại toàn tài liệu]
+    L --> N[8. Crop dòng nghi ngờ<br/>Qwen đọc lại từ ảnh]
+    N --> O{Độ tin cậy >= 0.98?}
+    O -->|Có| P[Áp dụng sửa lỗi OCR]
+    O -->|Không| Q[Giữ OCR ban đầu]
+    P --> M[9. Hoàn thiện Markdown và ảnh nội dung]
+    Q --> M
 ```
 
 1. **Trích xuất ảnh (Render):** Chuyển đổi các trang PDF thành ảnh PNG thông qua `PyMuPDF`.
 2. **Phân tích bố cục (Layout Detection):** Dùng `PaddleOCR` (tuỳ chọn) quét toạ độ cột văn bản, bảng biểu và hình vẽ.
    - *Nếu có bảng:* Tự động render lại trang với độ phân giải siêu nét (300 DPI) để chống vỡ chữ.
    - *Nếu chia cột:* Tự động cắt riêng từng cột và đọc tuần tự từ trái qua phải.
-3. **Trích xuất Hình ảnh & Toán học:** 
-   - Hình vẽ, sơ đồ trên trang được cắt và lưu thành file thật vào thư mục `images/`.
-   - Vùng công thức toán học được trích xuất riêng biệt bằng `LaTeX-OCR` để lấy mã LaTeX chuẩn.
-4. **Nhận diện bằng AI (Vision VLM OCR):** Gửi ảnh qua mô hình `Qwen` (Ollama) kèm theo hướng dẫn prompt nghiêm ngặt. Các hình vẽ và công thức được Qwen đặt "placeholder" (giữ chỗ).
+3. **Nhận diện công thức:** Vùng công thức có thể được đọc riêng bằng `LaTeX-OCR`; crop chỉ nằm trong thư mục tạm.
+4. **Nhận diện bằng AI:** Qwen OCR toàn trang và chỉ chép nội dung nhìn thấy. Layout là gợi ý hình học, không được phép làm mất chữ nằm trong vùng bị gắn nhãn ảnh/con dấu.
 5. **Cơ chế tự sửa lỗi (Self-Correction):** Nếu phát hiện Qwen xuất bảng bị vỡ hoặc sai định dạng Markdown, hệ thống tự động bắt AI chạy lại (Retry) với hướng dẫn sửa lỗi cấu trúc bảng HTML.
-6. **Lắp ráp & Hoàn thiện (Post-processing):** 
-   - Thay thế placeholder bằng mã LaTeX gốc và đường dẫn hình ảnh vật lý.
-   - Khi layout có đủ tọa độ, OCR riêng block tiêu đề/văn bản/bảng và chèn block ảnh trực tiếp theo reading order; placeholder chỉ còn là fallback.
-   - Gộp các trang lại và kích hoạt **Smart Table Merger** để nối các bảng bị ngắt quãng giữa 2 trang.
-7. **Xuất kết quả:** Lưu file `.md` cuối cùng; thời gian chi tiết được ghi trong log chạy.
+6. **Quality gate:** Kiểm tra bảng, Markdown, LaTeX, nội dung lặp, mất dấu diện rộng và placeholder. Lỗi diện rộng làm Qwen OCR lại toàn trang.
+7. **Hậu kiểm không phụ thuộc loại tài liệu:** Vùng cuối trang cuối luôn được đối chiếu với ảnh; không yêu cầu `Số`, `Nơi nhận`, tên cơ quan hay chức danh cố định.
+8. **Hậu kiểm bằng ảnh:** Từ điển và heuristic chỉ tìm ứng viên. Qwen đọc lại crop có ngữ cảnh; kết quả JSON không hợp lệ, thay đổi quá rộng hoặc độ tin cậy dưới `0.98` đều bị từ chối.
+9. **Hoàn thiện:** Gộp trang/bảng, chuẩn hóa cấu trúc, ghi file Markdown và chỉ giữ các ảnh nội dung được Markdown tham chiếu.
+
+### Nguyên tắc chữ ký, con dấu và chính tả
+
+* OCR và giữ chữ in như chức danh, tên cơ quan, họ tên và `Nơi nhận`.
+* Không biến nét ký tay hoặc hình con dấu thành văn bản suy đoán.
+* Chữ trong dấu chỉ giữ khi đọc được rõ ràng; không chèn ảnh chữ ký/con dấu.
+* Bộ kiểm tra chính tả không trực tiếp sửa Markdown. Mọi sửa đổi phải được Qwen xác minh lại từ ảnh.
+* Lỗi chính tả có sẵn trên bản gốc được giữ nguyên; Markdown không thay thế giá trị pháp lý của PDF nguồn.
 
 ---
 
@@ -186,15 +204,24 @@ Các script nghiệp vụ chính đã được tổ chức lại trong thư mụ
 
 ### 1. Khởi chạy Giao diện Đồ họa (GUI)
 Công cụ đồ họa Tkinter để chuyển đổi PDF trực quan, hỗ trợ chọn file/folder, hiển thị 2 thanh tiến trình và nhật ký thời gian thực.
-```bash
+```powershell
 .\.venv\Scripts\Activate.ps1
+python run_gui.py
 ```
 
 ### 2. Xử lý hàng loạt qua dòng lệnh (Batch OCR)
-Tự động quét tất cả tệp PDF trong thư mục `PDF/` và xuất kết quả sang thư mục `OCR/` dưới định dạng Markdown & hình ảnh trích xuất:
+Tự động quét tất cả PDF trong thư mục `PDF/` và ghi một file Markdown cho mỗi tài liệu vào `OCR/`:
 ```bash
 python batch_ocr.py
 ```
+
+Có thể chỉ định đầu vào, đầu ra, model và số luồng:
+
+```powershell
+python batch_ocr.py --input PDF --output OCR --model qwen3.5:4b --workers 1
+```
+
+Pipeline batch hiện nhận file PDF hoặc thư mục chứa PDF. Nội dung bên trong có thể thuộc nhiều loại tài liệu; quy tắc chuyên ngành không thay thế lõi OCR tổng quát.
 
 ### 3. Bộ kiểm tra chất lượng kết quả (OCR Validator)
 Kiểm tra cấu trúc và tính hợp lệ của tệp Markdown sau OCR (lỗi KaTeX, công thức toán bị gom cụm, lỗi thẻ ảnh):
@@ -215,6 +242,7 @@ qwen-ocr-ollama/
 │   │   ├── batch_ocr.py        # Pipeline OCR hàng loạt dùng chung cho CLI/GUI
 │   │   ├── block_assembler.py  # Lắp ráp khối chữ, bảng và ảnh theo luồng đọc
 │   │   ├── formula_ocr.py      # Nhận diện công thức tùy chọn bằng LaTeX-OCR
+│   │   ├── image_grounded_review.py # Phát hiện ứng viên, crop tạm và xác minh lại bằng ảnh
 │   │   ├── layout_detector.py  # PaddleOCR layout, cột, bảng, ảnh và overlay
 │   │   ├── math_cleanup.py     # Chuẩn hóa và kiểm tra cấu trúc LaTeX/đáp án
 │   │   ├── ocr_metrics.py      # Chỉ số đánh giá kết quả OCR/Markdown
@@ -231,7 +259,7 @@ qwen-ocr-ollama/
 │       └── run_gui.py          # Triển khai giao diện đồ họa Tkinter
 │
 ├── PDF/                        # Thư mục chứa các tệp PDF đầu vào mặc định
-├── OCR/                        # Thư mục chứa kết quả Markdown & ảnh (images/) đầu ra mặc định
+├── OCR/                        # Thư mục chứa các file Markdown đầu ra mặc định
 ├── samples/                    # Dữ liệu mẫu thử nghiệm
 ├── tests/                      # Unit test, integration test và benchmark
 │   ├── test_*.py               # Bộ kiểm thử tự động

@@ -16,6 +16,7 @@ from pathlib import Path
 from time import perf_counter
 import time
 import gc
+import unicodedata
 
 def generate_with_retry(client, kwargs, max_retries=3, log_func=print):
     last_err = None
@@ -28,6 +29,7 @@ def generate_with_retry(client, kwargs, max_retries=3, log_func=print):
             if attempt < max_retries:
                 time.sleep(2)
                 gc.collect()
+    # pyrefly: ignore [bad-raise]
     raise last_err
 
 # pyrefly: ignore [missing-import]
@@ -49,8 +51,13 @@ BoundingBox = tuple[float, float, float, float]
 # Đặt False để bỏ qua Paddle layout detection và buộc gửi cả trang đầy đủ cho Qwen
 ENABLE_LAYOUT_DETECTION = True
 
+# Persist genuine content images beside Markdown. Temporary review/layout
+# crops remain ephemeral; signature/stamp regions are filtered separately.
+TEXT_ONLY_OUTPUT = False
+
 # DPI độ phân giải cao hơn dành riêng cho các trang có bảng biểu được nhận diện
 TABLE_RENDER_DPI = 300
+
 
 # Hàm đối chiếu/ánh xạ tên mô hình từ GUI sang tên mô hình Ollama tương ứng
 def resolve_qwen_model(model_name: str) -> str:
@@ -68,35 +75,65 @@ def resolve_qwen_model(model_name: str) -> str:
         return selected.partition(":")[2].strip() or MODEL
     return selected or MODEL
 
+
 # Hướng dẫn prompt chính để nạp cho mô hình Vision
 PROMPT = """
 Convert this scanned document page image into clean Markdown format.
 
+ABSOLUTE OCR-ONLY RULE (highest priority): Transcribe only text that is visibly
+present in the image. Never answer questions, solve exercises, write essays,
+continue incomplete passages, infer an answer key, summarize, explain, or add
+any new content. If the page is an exam or questionnaire, copy the questions
+and blank answer areas only. Output answers or solutions only when those exact
+words are visibly printed on the current image. When text is unclear, preserve
+the readable portion; do not guess or complete it from context.
+
 Follow these strict structural and formatting guidelines:
 1. Document Structure & Layout:
    - Identify and format headings (using appropriate #, ##, ### levels), paragraphs, blockquotes, lists (ordered and unordered), and code blocks.
+   - Put each heading on its own physical line. Never place two Markdown headings (`#`, `##`, `###`, etc.) on the same line.
+   - Put each multiple-choice option (A., B., C., D. or A), B), C), D)) on its own line; never join two options on one line and never use `\\hfill`.
+   - For official/administrative documents with two-column headers (Issuing Agency on the left and National Motto/Date on the right), transcribe BOTH columns completely on separate lines.
    - Maintain the natural reading flow. For multi-column layouts, read column-by-column rather than spanning across columns.
-   - Detect and remove noise like running page headers, footers, page numbers, and repeating watermarks to keep the main content clean.
+   - Detect and remove noise like running page headers, footers, page numbers, repeating publication names, and footer hashtags to keep the main content clean.
 
 2. Mathematical Expressions:
    - Identify all mathematical formulas, symbols, variables, subscripts, and equations.
    - Wrap inline mathematical symbols/expressions in single dollar signs (`$...$`) and block equations in double dollar signs (`$$...$$`).
-   - Use standard LaTeX notation (e.g., standard symbols, Greek letters, fractions using `\frac{num}{den}`, and subscripts).
+   - Use standard LaTeX notation (e.g., standard symbols, Greek letters, fractions using `\\frac{num}{den}`, and subscripts).
    - Ensure every formula has its own closed pair of dollar signs. Do not merge separate items, punctuation, or non-math labels inside the same dollar sign block.
 
 3. Tables & Figures:
    - Convert simple tables into standard Markdown tables.
    - For complex tables (with merged rows/columns or nested cells), format them using clean HTML `<table>` tags.
-   - For any figures, diagrams, or illustrations, represent them with a markdown image tag: `![Description of the illustration](image_placeholder.png)`.
+   - If a table continues from the previous page, preserve its column structure and do not invent a new header. Keep image placeholders outside table markup.
+   - Use `image_placeholder` only for genuine photographs, charts, logos, or primarily graphical illustrations.
+   - Text boxes, callouts, framed notes, forms, and flowchart/diagram nodes containing text MUST be transcribed completely as Markdown (use blockquotes, lists, or tables where appropriate). Never replace their readable text with an image placeholder.
+   - For a genuine figure that also contains readable labels, emit one image tag and transcribe its important visible text immediately below the tag.
+   - Layout labels are only hints. Never let an `image`, `figure`, `seal`, stamp,
+     signature, drawing, or overlapping graphic region suppress readable text.
+     Transcribe every readable linguistic text element first, regardless of the
+     document type or where it appears (including text beside or underneath a
+     stamp/signature and text printed inside a graphic).
+   - Do not turn non-text pen strokes, signature flourishes, or stamp artwork
+     into invented words. Transcribe handwriting only when it is genuinely
+     readable as text. Transcribe text inside a stamp only when the characters
+     are clear enough to read without guessing.
+   - Do not emit an image tag for a signature or stamp by default. Do not add an
+     evidence note such as `[Signed and stamped]` unless a separate instruction
+     explicitly requests it.
 
 4. General Rules:
    - Keep the original text exactly as written, preserving the language (Vietnamese, English, etc.) and spelling.
+   - Inspect stylized/display fonts character by character, especially Vietnamese diacritics and easily confused letters. Use surrounding context only to choose among glyphs that are actually visible, never to invent text.
    - Do not summarize, explain, or add any introductory/concluding text.
    - Return only the raw Markdown content. Do not wrap the final output in ```markdown blocks.
 """.strip()
 
+
 # Chỉ lệnh bắt buộc đối với trang chứa bảng biểu
 TABLE_SAFE_INSTRUCTION = """
+
 
 LƯU Ý BẮT BUỘC VỀ BẢNG: Trang này có bảng biểu. Đọc toàn bộ ảnh trang, không đọc theo cột bị cắt.
 MỌI bảng trên trang này bắt buộc dùng HTML `<table>` với `<tr>`, `<th>`, `<td>`, `rowspan` và `colspan`
@@ -118,6 +155,8 @@ TABLE_STRUCTURE_REPAIR_PROMPT = """Bạn là bộ sửa cấu trúc bảng OCR.
 Hãy trả về lại TOÀN BỘ nội dung trang dưới dạng Markdown, nhưng mọi bảng bắt buộc là HTML hợp lệ:
 `<table><tr><th>...</th></tr><tr><td>...</td></tr></table>`.
 Không được có dòng bảng dùng dấu `|`; không lời dẫn giải; không bỏ, lặp hoặc suy diễn nội dung.
+CHỈ chép chữ thực sự nhìn thấy trong ảnh. TUYỆT ĐỐI KHÔNG trả lời câu hỏi, giải bài, viết bài văn,
+hoàn thành nội dung còn thiếu hoặc thêm đáp án không hiện diện trong ảnh.
 
 KẾT QUẢ OCR CẦN SỬA CẤU TRÚC:
 ---
@@ -125,7 +164,25 @@ KẾT QUẢ OCR CẦN SỬA CẤU TRÚC:
 ---""".strip()
 
 QUALITY_RETRY_INSTRUCTION = """The previous OCR result failed these quality checks: {errors}.
-OCR this page again from the image. Preserve all visible content and layout. Ensure Vietnamese diacritics and spaces are correct, math delimiters are balanced, tables are valid Markdown/HTML, and do not emit unresolved placeholders."""
+OCR this page again from the image. Preserve all visible content and layout. Ensure Vietnamese diacritics and spaces are correct, math delimiters are balanced, tables are valid Markdown/HTML, and do not emit unresolved placeholders. Transcribe only text visibly present in the image; never answer questions, solve exercises, write essays, or add inferred content."""
+
+MIXED_VI_EN_RETRY_INSTRUCTION = """This is a mixed Vietnamese-English document. Detect language per sentence and term.
+Preserve English words, abbreviations, product names, URLs and code exactly without adding Vietnamese diacritics.
+For Vietnamese text, copy every visible diacritic character by character. Do not translate, localize, or autocorrect either language."""
+
+REPETITION_RETRY_INSTRUCTION = """The previous output entered a repetition loop. Transcribe each visible line exactly once.
+Stop when reaching the physical bottom of the image. Do not continue, reconstruct, or repeat a paragraph even when the background, watermark, or decorative typography is ambiguous."""
+
+
+def quality_retry_instruction(markdown: str, errors: str) -> str:
+    """Build a document-type-specific retry instruction."""
+    from app.core.quality_gate import detect_language_profile
+    instruction = QUALITY_RETRY_INSTRUCTION.format(errors=errors)
+    if detect_language_profile(markdown) == "mixed_vi_en":
+        instruction += "\n\n" + MIXED_VI_EN_RETRY_INSTRUCTION
+    if "repetition_loop" in errors or "repeated_words" in errors:
+        instruction += "\n\n" + REPETITION_RETRY_INSTRUCTION
+    return instruction
 
 # Hàm kiểm tra xem trang PDF có phải là các mảnh quét nhỏ xếp kề nhau hay không
 def _is_tiled_scan(page, image_list) -> bool:
@@ -169,19 +226,104 @@ def needs_table_retry(markdown: str) -> bool:
     markdown_pipe_table = bool(re.search(r"^\s*\|.+\|\s*$\n\s*\|[\s:|-]+\|", markdown, re.MULTILINE))
     html = markdown.casefold()
     malformed_html_table = "<table" in html and "</table>" not in html
-    
+
     # Kiểm tra xem có dấu hiệu của bảng trong đầu ra không
     has_table_indicators = "|" in markdown or "tr>" in html or "td>" in html or "table" in html
-    
+
     # Chúng ta chỉ quan tâm đến bảng HTML bị thiếu nếu có xuất hiện chỉ báo bảng hoặc bullet thụt lề lớn
     missing_html_table = ("<table" not in html) and (has_table_indicators or nested_bullets >= 3) and not markdown_pipe_table
-    
-    return nested_bullets >= 3 or has_placeholder_heading or malformed_html_table or missing_html_table
+
+    from app.core.quality_gate import html_table_structure_errors
+    invalid_spans = bool(html_table_structure_errors(markdown))
+    return nested_bullets >= 3 or has_placeholder_heading or malformed_html_table or missing_html_table or invalid_spans
 
 
 def normalize_worker_count(workers: int, model_name: str) -> int:
     """Use the same conservative 1-2 worker range in CLI and GUI."""
     return max(1, min(int(workers), 2))
+
+
+def _text_stats_in_rect(page, rect) -> tuple[int, int, float]:
+    """Return word count, character count, and approximate text coverage."""
+    words = page.get_text("words", clip=rect) or []
+    word_count = len(words)
+    character_count = sum(len(str(word[4]).strip()) for word in words if len(word) > 4)
+    rect_area = max(float(rect.get_area()), 1.0)
+    covered_area = 0.0
+    for word in words:
+        if len(word) < 5:
+            continue
+        word_rect = pymupdf.Rect(word[:4]) & rect
+        if not word_rect.is_empty:
+            covered_area += word_rect.get_area()
+    return word_count, character_count, min(covered_area / rect_area, 1.0)
+
+
+def _is_text_heavy_region(page, rect) -> bool:
+    """Protect paragraphs and short text callouts misclassified as figures."""
+    word_count, character_count, coverage = _text_stats_in_rect(page, rect)
+    return (
+        word_count >= 10
+        or (word_count >= 4 and character_count >= 20 and coverage >= 0.035)
+        or (word_count >= 2 and character_count >= 12 and coverage >= 0.12)
+    )
+
+
+def _padded_box(bbox: BoundingBox, width: float, height: float) -> BoundingBox:
+    """Add proportional safe padding without crossing image boundaries."""
+    left, top, right, bottom = bbox
+    pad_x = max(10.0, (right - left) * 0.05)
+    pad_y = max(10.0, (bottom - top) * 0.05)
+    return (
+        max(0.0, left - pad_x), max(0.0, top - pad_y),
+        min(width, right + pad_x), min(height, bottom + pad_y),
+    )
+
+
+def _keep_vector_drawing(rect, page_width: float, page_height: float) -> bool:
+    """Reject rules, borders, and marginal vector decorations before merging."""
+    if rect.is_empty or rect.width <= 10 or rect.height <= 10:
+        return False
+    aspect_ratio = rect.width / max(rect.height, 0.001)
+    if aspect_ratio > 12 or aspect_ratio < 0.08:
+        return False
+    if rect.y0 < page_height * 0.05 or rect.y1 > page_height * 0.95:
+        return False
+    if rect.width > page_width * 0.9 or rect.height > page_height * 0.9:
+        return False
+    return True
+
+
+def _is_full_page_canvas(rect, page_width: float, page_height: float) -> bool:
+    """Identify a raster used as the scanned page canvas, not an illustration."""
+    page_area = max(page_width * page_height, 1.0)
+    return rect.get_area() / page_area > 0.80
+
+
+def _nearby_text(page, rect, margin: float = 36.0) -> str:
+    expanded = pymupdf.Rect(
+        max(0.0, rect.x0 - margin), max(0.0, rect.y0 - margin),
+        min(page.rect.width, rect.x1 + margin), min(page.rect.height, rect.y1 + margin),
+    )
+    values = []
+    for word in page.get_text("words") or []:
+        if len(word) >= 5 and not (pymupdf.Rect(word[:4]) & expanded).is_empty:
+            values.append(str(word[4]))
+    return " ".join(values)
+
+
+def _is_bottom_signature_or_stamp(page, rect) -> bool:
+    """Conservatively reject an uncaptained signature/stamp region at page end."""
+    if rect.y0 < page.rect.height * 0.78:
+        return False
+    context = _nearby_text(page, rect).casefold()
+    has_caption = bool(re.search(r"\b(?:hình|ảnh|figure|photo|biểu\s*đồ|sơ\s*đồ)\s*\d*\b", context))
+    signature_cues = bool(re.search(
+        r"\b(?:tm\.?|kt\.?|tl\.?|tuq\.?|chủ\s*tịch|phó\s*chủ\s*tịch|"
+        r"giám\s*đốc|phó\s*giám\s*đốc|nơi\s*nhận|ký\s*tên|đã\s*ký)\b",
+        context,
+    ))
+    return signature_cues and not has_caption
 
 
 # Hàm trích xuất các hình ảnh từ PDF sử dụng PP-DocLayout hoặc PyMuPDF làm fallback
@@ -194,7 +336,7 @@ def extract_images_from_page(
 ) -> list[str]:
     """Trích xuất hình ảnh trang bằng PP-DocLayout khi khả dụng; nếu không sẽ lùi về dùng PyMuPDF."""
     # pyrefly: ignore [missing-import]
-    from PIL import Image 
+    from PIL import Image
     from app.core.layout_detector import BoundingBox
 
     doc = pymupdf.open(pdf_path)
@@ -202,14 +344,14 @@ def extract_images_from_page(
     page_rect = page.rect
     page_width = page_rect.width
     page_height = page_rect.height
-    
+
     extracted_items: list[tuple[str, BoundingBox]] = []
     output_img_dir.mkdir(parents=True, exist_ok=True)
-    
+
     layout_images_extracted = False
     img_width = page_width
     img_height = page_height
-    
+
     # 1. Sử dụng PP-DocLayout nếu có thực thể layout_detector và page_image_path hợp lệ
     if layout_detector is not None and page_image_path is not None and page_image_path.exists():
         try:
@@ -217,12 +359,13 @@ def extract_images_from_page(
             with Image.open(page_image_path) as img:
                 img_width = img.width
                 img_height = img.height
-            
+
             # Reuse the caller's single page analysis when available.
             if detected_images is None:
                 _, detected_images = layout_detector.detect_layout_tables_and_images(image_bytes)
-            
+
             if detected_images:
+                accepted_images: list[BoundingBox] = []
                 with Image.open(page_image_path) as image:
                     for img_idx, bbox in enumerate(detected_images, 1):
                         left, top, right, bottom = bbox
@@ -231,10 +374,26 @@ def extract_images_from_page(
                         top = max(0.0, min(top, float(img_height)))
                         right = max(left + 1.0, min(right, float(img_width)))
                         bottom = max(top + 1.0, min(bottom, float(img_height)))
-                        
+
+                        pdf_rect = pymupdf.Rect(
+                            left * page_width / img_width, top * page_height / img_height,
+                            right * page_width / img_width, bottom * page_height / img_height,
+                        )
+                        if _is_text_heavy_region(page, pdf_rect):
+                            print(f"    -> Kept text-heavy layout region {img_idx} for OCR instead of cropping it as an image.")
+                            continue
+                        if _is_bottom_signature_or_stamp(page, pdf_rect):
+                            print(f"    -> Ignored uncaptained signature/stamp layout region {img_idx}.")
+                            continue
+
+                        accepted_images.append(bbox)
+                        left, top, right, bottom = _padded_box(
+                            (left, top, right, bottom), float(img_width), float(img_height)
+                        )
+
                         crop_path = output_img_dir / f"{prefix}_page_{page_index + 1}_layout_img_{img_idx}.png"
                         image.crop((left, top, right, bottom)).save(crop_path)
-                        
+
                         # Chuẩn hóa tọa độ về dải 0.0 - 1.0
                         norm_bbox = (
                             left / img_width,
@@ -242,10 +401,14 @@ def extract_images_from_page(
                             right / img_width,
                             bottom / img_height
                         )
-                        
+
                         extracted_items.append((f"images/{crop_path.name}", norm_bbox))
+                detected_images[:] = accepted_images
+                # The detector handled the candidate set even when every item
+                # was intentionally filtered. Do not re-extract rejected
+                # stamps/signatures through the PyMuPDF fallback below.
                 layout_images_extracted = True
-                print(f"    -> Extracted {len(detected_images)} images via PP-DocLayout on page {page_index + 1}.")
+                print(f"    -> Extracted {len(accepted_images)} images via PP-DocLayout on page {page_index + 1}.")
         except Exception as layout_err:
             print(f"    -> [Warning] PP-DocLayout image extraction failed, falling back to PyMuPDF: {layout_err}")
             layout_images_extracted = False
@@ -254,7 +417,7 @@ def extract_images_from_page(
     if not layout_images_extracted:
         image_list = page.get_images(full=True)
         tiled_scan = _is_tiled_scan(page, image_list)
-        
+
         # Trích xuất ảnh raster thường
         for img_idx, img_info in enumerate(() if tiled_scan else image_list, 1):
             xref = img_info[0]
@@ -262,15 +425,22 @@ def extract_images_from_page(
                 base_image = doc.extract_image(xref)
                 image_bytes = base_image["image"]
                 image_ext = base_image["ext"]
-                
-                img_name = f"{prefix}_page_{page_index + 1}_img_{img_idx}.{image_ext}"
-                img_path = output_img_dir / img_name
-                img_path.write_bytes(image_bytes)
-                
+
                 # Xác định vị trí của ảnh trên trang
                 rects = page.get_image_rects(xref)
                 if rects:
                     r = rects[0]
+                    if any(_is_full_page_canvas(rect, page_width, page_height) for rect in rects):
+                        print(f"    -> Ignored full-page scan canvas image {img_idx}.")
+                        continue
+                    # Tiny bitmap ornaments should not enter the generic image
+                    # fallback at all. Keep the threshold aligned with vector
+                    # crop filtering below.
+                    if r.get_area() < page_width * page_height * 0.002:
+                        continue
+                    if _is_bottom_signature_or_stamp(page, r):
+                        print(f"    -> Ignored uncaptained signature/stamp raster image {img_idx}.")
+                        continue
                     norm_bbox = (
                         r.x0 / page_width,
                         r.y0 / page_height,
@@ -279,25 +449,25 @@ def extract_images_from_page(
                     )
                 else:
                     norm_bbox = (0.0, 0.0, 1.0, 1.0)
-                    
+
+                img_name = f"{prefix}_page_{page_index + 1}_img_{img_idx}.{image_ext}"
+                img_path = output_img_dir / img_name
+                img_path.write_bytes(image_bytes)
+
                 extracted_items.append((f"images/{img_name}", norm_bbox))
             except Exception as e:
                 print(f"Error extracting image xref {xref} on page {page_index}: {e}")
-                
+
         # Trích xuất hình vẽ vector
         try:
             drawings = page.get_drawings()
             candidate_rects = []
             for d in drawings:
                 r = d["rect"]
-                if r.is_empty:
-                    continue
-                if r.y1 < page_height * 0.12 or r.y0 > page_height * 0.88:
-                    continue
-                if r.width > page_width * 0.9 or r.height > page_height * 0.9:
+                if not _keep_vector_drawing(r, page_width, page_height):
                     continue
                 candidate_rects.append(r)
-                
+
             if candidate_rects:
                 threshold = 30
                 merged = []
@@ -311,7 +481,7 @@ def extract_images_from_page(
                             break
                     if not placed:
                         merged.append(r)
-                
+
                 changed = True
                 while changed:
                     changed = False
@@ -328,17 +498,11 @@ def extract_images_from_page(
                         if not placed:
                             new_merged.append(r)
                     merged = new_merged
-                
-                text_word_centres = [
-                    pymupdf.Point((word[0] + word[2]) / 2, (word[1] + word[3]) / 2)
-                    for word in page.get_text("words")
-                ]
-                
+
                 for c_idx, rect in enumerate(merged, len(image_list) + 1):
-                    words_in_rect = sum(rect.contains(centre) for centre in text_word_centres)
-                    if words_in_rect >= 30:
+                    if _is_text_heavy_region(page, rect):
                         continue
-                    
+
                     padding = 10
                     crop_rect = pymupdf.Rect(
                         max(0, rect.x0 - padding),
@@ -353,11 +517,11 @@ def extract_images_from_page(
                     pix = page.get_pixmap(matrix=mat, clip=crop_rect)
                     if pix.width < 40 or pix.height < 40:
                         continue
-                    
+
                     img_name = f"{prefix}_page_{page_index + 1}_draw_{c_idx}.png"
                     img_path = output_img_dir / img_name
                     pix.save(str(img_path))
-                    
+
                     norm_bbox = (
                         crop_rect.x0 / page_width,
                         crop_rect.y0 / page_height,
@@ -369,10 +533,10 @@ def extract_images_from_page(
             print(f"Error extracting vector drawings on page {page_index}: {dev_err}")
 
     doc.close()
-    
+
     if not extracted_items:
         return []
-        
+
     # Cột được chuẩn hóa: danh sách các BoundingBox trong dải 0.0 - 1.0
     norm_segments: list[BoundingBox] = []
     if segments:
@@ -380,10 +544,10 @@ def extract_images_from_page(
         height_divisor = float(img_height)
         for left, top, right, bottom in segments:
             norm_segments.append((
-                left / width_divisor, top / height_divisor, 
+                left / width_divisor, top / height_divisor,
                 right / width_divisor, bottom / height_divisor
             ))
-            
+
     # Hàm xác định chỉ số phân đoạn của ảnh dựa trên tọa độ trung tâm
     def get_segment_idx(norm_bbox: BoundingBox) -> int:
         if not norm_segments or len(norm_segments) <= 1:
@@ -407,25 +571,60 @@ def extract_images_from_page(
 
     # Sắp xếp ảnh: theo thứ tự phân đoạn trước, sau đó từ trên xuống dưới, sau đó từ trái sang phải
     extracted_items.sort(key=lambda item: (get_segment_idx(item[1]), item[1][1], item[1][0]))
-    
+
     return [path for path, _ in extracted_items]
 
 
 # Hàm gộp các khối bảng Markdown bị phân mảnh thành một bảng thống nhất
 def merge_markdown_tables(markdown_text: str) -> str:
+    def is_bridge_text(value: str) -> bool:
+        residual = re.sub(r"<!--.*?-->", "", value, flags=re.DOTALL)
+        residual = re.sub(r"!\[[^\]]*\]\([^)]+\)", "", residual)
+        residual = re.sub(
+            r"(?im)^\s*(?:hình|ảnh|figure|nguồn\s*:)[^\n]*$", "", residual
+        )
+        return not residual.strip()
+
+    # Join complete HTML tables separated only by page metadata/figures. Keep
+    # the bridge after the combined table so image Markdown never sits inside
+    # invalid <table> markup.
+    html_table_re = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+    while True:
+        matches = list(html_table_re.finditer(markdown_text))
+        merged = False
+        for left, right in zip(matches, matches[1:]):
+            bridge = markdown_text[left.end():right.start()]
+            if not is_bridge_text(bridge):
+                continue
+            first = left.group(0)
+            second = right.group(0)
+            combined = (
+                first[: first.lower().rfind("</table>")]
+                + second[second.find(">") + 1 : second.lower().rfind("</table>")]
+                + "</table>"
+                + bridge
+            )
+            markdown_text = markdown_text[:left.start()] + combined + markdown_text[right.end():]
+            merged = True
+            break
+        if not merged:
+            break
+
     lines = markdown_text.splitlines()
     blocks = []
-    
+
     i = 0
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
-        
+
         is_table_start = stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") > 1
-        if is_table_start and i + 1 < len(lines):
-            next_stripped = lines[i + 1].strip()
-            is_sep = next_stripped.startswith("|") and next_stripped.endswith("|") and all(c in " -:+|" for c in next_stripped)
-            if is_sep:
+        if is_table_start:
+            has_header = False
+            if i + 1 < len(lines):
+                next_stripped = lines[i + 1].strip()
+                has_header = next_stripped.startswith("|") and next_stripped.endswith("|") and all(c in " -:+|" for c in next_stripped)
+            if has_header or blocks:
                 table_rows = []
 
                 table_comments = []
@@ -441,14 +640,36 @@ def merge_markdown_tables(markdown_text: str) -> str:
                         i += 1
                     else:
                         break
+
+                if table_rows:
+                    header_cells = [c.strip().casefold() for c in _split_markdown_table_row(table_rows[0])]
+                    cleaned_rows = [table_rows[0]]
+                    skip_next_if_sep = False
+                    for r in table_rows[1:]:
+                        cur_cells = [c.strip().casefold() for c in _split_markdown_table_row(r)]
+                        if cur_cells == header_cells:
+                            skip_next_if_sep = True
+                            continue
+                        if skip_next_if_sep and all(c in " -:+|" for c in "".join(cur_cells)):
+                            skip_next_if_sep = False
+                            continue
+                        skip_next_if_sep = False
+                        cleaned_rows.append(r)
+                    table_rows = cleaned_rows
+
                 blocks.append({
                     "type": "table",
                     "rows": table_rows,
-                    "comments": table_comments
+                    "comments": table_comments,
+                    "has_header": has_header,
                 })
                 continue
-                
+
         if stripped.startswith("<!--") and stripped.endswith("-->"):
+            blocks.append({"type": "comment", "line": line})
+        elif re.fullmatch(r"!\[[^\]]*\]\([^)]+\)", stripped):
+            blocks.append({"type": "comment", "line": line})
+        elif re.match(r"^(?:Hình|Ảnh|Figure|Nguồn\s*:)", stripped, re.IGNORECASE):
             blocks.append({"type": "comment", "line": line})
         else:
             blocks.append({"type": "text", "line": line})
@@ -471,22 +692,30 @@ def merge_markdown_tables(markdown_text: str) -> str:
                 else:
                     only_whitespace_or_comments = False
                     break
-            
+
             if found_table_idx is not None and only_whitespace_or_comments:
                 last = merged_blocks[found_table_idx]
-                header_last = [c.strip().lower() for c in last["rows"][0].split("|")[1:-1]]
-                header_curr = [c.strip().lower() for c in block["rows"][0].split("|")[1:-1]]
-                
-                if header_last == header_curr:
-                    data_rows = block["rows"][2:]
+                last_columns = len(_split_markdown_table_row(last["rows"][0]))
+                current_columns = len(_split_markdown_table_row(block["rows"][0]))
+                header_last = [c.strip().casefold() for c in _split_markdown_table_row(last["rows"][0])]
+                header_curr = [c.strip().casefold() for c in _split_markdown_table_row(block["rows"][0])]
+                same_header = block["has_header"] and header_last == header_curr
+                continuation = not block["has_header"] and last_columns == current_columns
+
+                if same_header or continuation:
+                    data_rows = block["rows"][2:] if same_header else block["rows"]
                     last["rows"].extend(data_rows)
+                    last["comments"].extend(
+                        item["line"] for item in merged_blocks[found_table_idx + 1:]
+                        if item["type"] == "comment"
+                    )
                     last["comments"].extend(block["comments"])
                     # Loại bỏ các dòng trống/bình luận chen giữa các phần bảng
                     del merged_blocks[found_table_idx + 1:]
                     continue
-                    
+
         merged_blocks.append(block)
-        
+
     output = []
     for block in merged_blocks:
         if block["type"] == "text":
@@ -496,7 +725,7 @@ def merge_markdown_tables(markdown_text: str) -> str:
         elif block["type"] == "table":
             output.extend(block["rows"])
             output.extend(block["comments"])
-            
+
     return "\n".join(output)
 
 
@@ -656,7 +885,7 @@ def link_extracted_images(markdown: str, extracted_paths: list[str]) -> tuple[st
 
 
 def apply_page_assets(markdown: str, page_number: int, image_paths: list[str], formulas: list[str] | None = None) -> str:
-    """Replace formula/image placeholders and append images the model did not place."""
+    """Replace explicit placeholders; never auto-insert unrequested images."""
     if formulas is not None:
         iterator = iter(formulas)
         unused_formulas = list(formulas)
@@ -673,7 +902,7 @@ def apply_page_assets(markdown: str, page_number: int, image_paths: list[str], f
         if unused_formulas:
             markdown = f"{markdown.rstrip()}\n\n" + "\n\n".join(unused_formulas)
     pending_images = [path for path in image_paths if f"]({path})" not in markdown]
-    markdown, unplaced = link_extracted_images(markdown, pending_images)
+    markdown, _unplaced = link_extracted_images(markdown, pending_images)
     # Qwen may emit more image placeholders than the PDF extractor finds (it
     # often mistakes formulas or decorations for figures). These placeholders
     # have no valid file to link and should not trigger a costly full-page retry.
@@ -690,10 +919,36 @@ def apply_page_assets(markdown: str, page_number: int, image_paths: list[str], f
         flags=re.IGNORECASE,
     )
     markdown = re.sub(r"\n{3,}", "\n\n", markdown).strip()
-    if unplaced:
-        fallback = "\n\n".join(f"![Hình ảnh trang {page_number}]({path})" for path in unplaced)
-        markdown = f"{markdown.rstrip()}\n\n{fallback}"
+    # Correct model-authored zero-based/stale generic page labels as well as
+    # labels created by our own fallback path. Descriptive alt text is kept.
+    markdown = re.sub(
+        r"(!\[\s*Hình ảnh trang\s+)\d+(\s*\]\([^)]+\))",
+        rf"\g<1>{page_number}\g<2>",
+        markdown,
+        flags=re.IGNORECASE,
+    )
+    # Unplaced assets are intentionally discarded from Markdown. The files may
+    # still exist for diagnostics, but only a model-authored placeholder can
+    # make an extracted image part of the document.
     return markdown
+
+
+def cleanup_unreferenced_assets(markdown: str, image_paths: list[str], output_dir: str | Path) -> int:
+    """Delete extracted local assets omitted from the final selected Markdown."""
+    root = Path(output_dir).resolve()
+    removed = 0
+    for path in image_paths:
+        if f"]({path})" in markdown or re.match(r"^(?:https?://|data:)", path, re.IGNORECASE):
+            continue
+        target = (root / path).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            continue
+        if target.is_file():
+            target.unlink()
+            removed += 1
+    return removed
 
 
 # Hàm dọn dẹp và chuẩn hóa văn bản Markdown nhận diện từ mô hình Vision
@@ -704,6 +959,7 @@ def clean_markdown(text: str) -> str:
     """
     import re
     text = text.strip()
+    text = re.sub(r"\\+hfill\b\s*", " ", text)
     if text.startswith("```markdown"):
         text = text[len("```markdown"):]
     elif text.startswith("```"):
@@ -719,7 +975,7 @@ def clean_markdown(text: str) -> str:
         text,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    
+
     # Loại bỏ thực thể khoảng trắng HTML
     text = text.replace("&nbsp;", " ")
     text = text.replace("&amp;nbsp;", " ")
@@ -741,7 +997,7 @@ def clean_markdown(text: str) -> str:
             line = line.replace("$", "")
         cleaned_lines.append(line)
     text = "\n".join(cleaned_lines)
-    
+
     # Sửa lỗi một khối công thức đô-la bao bọc nhiều phương án lựa chọn trắc nghiệm
     def repl(match):
         content = match.group(1)
@@ -768,6 +1024,37 @@ def clean_markdown(text: str) -> str:
 def post_process_markdown(text: str) -> str:
     """Apply final Markdown repairs shared by CLI and GUI."""
     text = re.sub(r"&(?:nbsp|amp);", " ", text)
+    text = re.sub(r"\\+hfill\b\s*", " ", text)
+    # Repair delimiter leakage at HTML cell boundaries before balancing each
+    # cell. These patterns occur in variation/sign tables emitted by small VLMs.
+    text = re.sub(
+        r"(<td\b[^>]*>)\s*([+-])\$\s*(</td>)",
+        r"\1$\2$\3",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"</td>\s*\$\s*(?=<td\b)", "</td>", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(<td\b[^>]*>)\s*\$\s*(</td>)\s*\$?",
+        r"\1\2",
+        text,
+        flags=re.IGNORECASE,
+    )
+    def balance_math(fragment: str) -> str:
+        dollar_indices = [
+            index for index, char in enumerate(fragment)
+            if char == "$" and (index == 0 or fragment[index - 1] != "\\")
+        ]
+        if len(dollar_indices) % 2 == 0:
+            return fragment
+        tail = fragment[dollar_indices[-1] + 1:]
+        # Do not turn a currency amount such as "$5" into mathematics.
+        if not re.search(r"[=+*/^_{}\\<>]|[A-Za-zÀ-ỹĐđ]\s*\d|\d\s*[A-Za-zÀ-ỹĐđ]", tail):
+            return fragment
+        stripped = fragment.rstrip()
+        punctuation = re.search(r"([.,;:!?])$", stripped)
+        return stripped[:-1] + "$" + stripped[-1] if punctuation else stripped + "$"
+
     processed_lines = []
     for line in text.splitlines():
         def split_merged_math(match):
@@ -781,13 +1068,19 @@ def post_process_markdown(text: str) -> str:
             return match.group(0)
 
         line = re.sub(r"(?<!\\)\$(.*?)(?<!\\)\$", split_merged_math, line)
-        dollar_indices = [
-            index for index, char in enumerate(line)
-            if char == "$" and (index == 0 or line[index - 1] != "\\")
-        ]
-        if len(dollar_indices) % 2:
-            stripped = line.rstrip()
-            line = stripped[:-1] + "$." if stripped.endswith(".") else stripped + "$"
+        if line.strip().startswith("|") and line.strip().endswith("|"):
+            cells = _split_markdown_table_row(line)
+            balanced_cells = [balance_math(cell) for cell in cells]
+            line = "| " + " | ".join(balanced_cells) + " |"
+        elif re.search(r"<(?:td|th)\b", line, re.IGNORECASE):
+            line = re.sub(
+                r"(<(?:td|th)\b[^>]*>)(.*?)(</(?:td|th)>)",
+                lambda match: match.group(1) + balance_math(match.group(2)) + match.group(3),
+                line,
+                flags=re.IGNORECASE,
+            )
+        else:
+            line = balance_math(line)
         processed_lines.append(line)
 
     result = "\n".join(processed_lines)
@@ -803,9 +1096,169 @@ def post_process_markdown(text: str) -> str:
     return normalize_answer_math(result)
 
 
-def finalize_markdown(markdown: str) -> str:
-    """Canonical finalization used by every frontend."""
-    return post_process_markdown(merge_markdown_tables(repair_markdown_tables(markdown)))
+from html.parser import HTMLParser
+
+class _SimpleHTMLTableParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[str]] = []
+        self.current_row: list[str] = []
+        self.current_cell: list[str] = []
+        self.has_complex_span = False
+        self.in_cell = False
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attrs_map = dict(attrs)
+        if tag == "tr":
+            self.current_row = []
+        elif tag in {"td", "th"}:
+            self.in_cell = True
+            self.current_cell = []
+            colspan = attrs_map.get("colspan")
+            rowspan = attrs_map.get("rowspan")
+            if (colspan and colspan != "1") or (rowspan and rowspan != "1"):
+                self.has_complex_span = True
+        elif tag == "br" and self.in_cell:
+            self.current_cell.append("<br>")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"}:
+            self.in_cell = False
+            cell_text = "".join(self.current_cell).strip()
+            cell_text = re.sub(r"\r?\n+", "<br>", cell_text)
+            self.current_row.append(cell_text)
+        elif tag == "tr":
+            if self.current_row:
+                self.rows.append(self.current_row)
+
+    def handle_data(self, data: str) -> None:
+        if self.in_cell:
+            self.current_cell.append(data)
+
+
+def convert_simple_html_tables_to_markdown(markdown: str) -> tuple[str, int]:
+    """Tự động chuyển đổi các bảng HTML đơn giản thành bảng Markdown pipe table (|)."""
+    table_re = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+    converted_count = 0
+
+    def replace_table(match: re.Match[str]) -> str:
+        nonlocal converted_count
+        html_code = match.group(0)
+        # Nếu có bảng lồng nhau, giữ nguyên HTML
+        if len(re.findall(r"<table\b", html_code, re.IGNORECASE)) > 1:
+            return html_code
+
+        parser = _SimpleHTMLTableParser()
+        try:
+            parser.feed(html_code)
+        except Exception:
+            return html_code
+
+        if parser.has_complex_span or not parser.rows or len(parser.rows) < 2:
+            return html_code
+
+        col_counts = [len(r) for r in parser.rows]
+        if not col_counts or len(set(col_counts)) > 1:
+            return html_code
+
+        num_cols = col_counts[0]
+        if num_cols < 2:
+            return html_code
+
+
+        md_lines = []
+        header_row = parser.rows[0]
+        header_normalized = [c.strip().casefold() for c in header_row]
+        md_lines.append("| " + " | ".join(c.replace("|", "\\|") for c in header_row) + " |")
+        md_lines.append("| " + " | ".join(":---" for _ in range(num_cols)) + " |")
+
+        for data_row in parser.rows[1:]:
+            row_normalized = [c.strip().casefold() for c in data_row]
+            if row_normalized == header_normalized:
+                continue
+            md_lines.append("| " + " | ".join(c.replace("|", "\\|") for c in data_row) + " |")
+
+        converted_count += 1
+        return "\n\n" + "\n".join(md_lines) + "\n\n"
+
+
+    result = table_re.sub(replace_table, markdown)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result, converted_count
+
+
+def finalize_markdown(
+    markdown: str, *, return_report: bool = False, spell_correct: bool = False
+):
+    """Canonical finalization used by every frontend, optionally with a report."""
+    from app.core.markdown_normalizer import MarkdownNormalizationStats, normalize_structure
+
+    stats = MarkdownNormalizationStats()
+    markdown = normalize_structure(markdown, stats)
+    table_count_before = len(re.findall(r"<table\b", markdown, re.IGNORECASE))
+    markdown = repair_markdown_tables(markdown)
+    tables_repaired = max(
+        0, len(re.findall(r"<table\b", markdown, re.IGNORECASE)) - table_count_before
+    )
+    markdown = merge_markdown_tables(markdown)
+
+    # Tự động chuyển các bảng HTML đơn giản sang bảng Markdown pipe table chuẩn (|)
+    markdown, tables_converted_to_md = convert_simple_html_tables_to_markdown(markdown)
+
+    before_math = markdown
+    markdown = post_process_markdown(markdown)
+    math_normalized = int(markdown != before_math)
+    from app.core.vietnamese_spell_corrector import (
+        correct_vietnamese_spelling, suggest_vietnamese_spelling,
+    )
+    spelling_warnings = suggest_vietnamese_spelling(markdown)
+    spell_fixed_count = 0
+    if spell_correct:
+        markdown, spell_fixed_count = correct_vietnamese_spelling(markdown)
+    report = {
+        "headings": stats.headings,
+        "headings_split": stats.headings_split,
+        "paragraph_lines_joined": stats.paragraph_lines_joined,
+        "list_lines_joined": stats.list_lines_joined,
+        "tables_repaired": tables_repaired,
+        "tables_converted_to_md": tables_converted_to_md,
+        "html_tags_closed": stats.html_tags_closed,
+        "math_normalized": math_normalized,
+        "image_paths": stats.image_paths,
+        "duplicate_images": stats.duplicate_images,
+        "page_artifacts_removed": stats.page_artifacts_removed,
+        "repetition_lines_removed": stats.repetition_lines_removed,
+        "spell_fixed": spell_fixed_count,
+        "spell_warnings": len(spelling_warnings),
+        "spelling_warnings": spelling_warnings,
+    }
+    return (markdown, report) if return_report else markdown
+
+
+def format_finalization_report(report: dict) -> list[str]:
+    """Return concise Vietnamese log lines for Markdown finalization."""
+    labels = {
+        "headings": "Heading đã chuẩn hóa",
+        "headings_split": "Heading dính dòng đã tách",
+        "paragraph_lines_joined": "Dòng văn bản đã nối",
+        "list_lines_joined": "Dòng danh sách đã nối",
+        "tables_repaired": "Bảng lỗi đã chuyển sang HTML",
+        "tables_converted_to_md": "Bảng HTML đơn giản đã chuyển sang Markdown",
+        "html_tags_closed": "Thẻ HTML đã đóng bổ sung",
+        "math_normalized": "Lượt chuẩn hóa công thức/LaTeX",
+        "image_paths": "Đường dẫn ảnh đã chuẩn hóa",
+        "duplicate_images": "Ảnh trùng đã loại bỏ",
+        "page_artifacts_removed": "Header/footer/số trang đã loại bỏ",
+        "repetition_lines_removed": "Dòng lặp hallucination đã loại bỏ",
+        "spell_fixed": "Từ tiếng Việt đã sửa theo ngữ cảnh",
+        "spell_warnings": "Từ nghi ngờ chính tả (chỉ cảnh báo)",
+    }
+    lines = [
+        f"{labels[key]}: {value}" for key, value in report.items()
+        if key in labels and value
+    ]
+
+    return lines or ["Không phát hiện lỗi định dạng cần sửa"]
 
 
 # Hàm lấy tổng số trang của file PDF
@@ -862,7 +1315,7 @@ def clear_gpu_cache():
     """Giải phóng tài nguyên bộ nhớ cache của PyTorch, PaddlePaddle và garbage collection hệ thống."""
     import gc
     gc.collect()
-    
+
     # Xóa bộ nhớ cache CUDA của PyTorch
     try:
         # pyrefly: ignore [missing-import]
@@ -958,7 +1411,7 @@ def ocr_qwen_images(
 
 def ocr_coordinate_blocks(
     client, model: str, page_image: Path, typed_blocks, image_paths: list[str],
-    output_dir: Path, *, log_func=print, before_request=None,
+    output_dir: Path, *, page_number: int = 1, log_func=print, before_request=None,
 ) -> str | None:
     """OCR a full page once and use detected image order to resolve placeholders.
 
@@ -995,11 +1448,40 @@ layout blocks and do not move all figures to the end.
         log_func=log_func,
         before_request=before_request,
     )
-    return apply_page_assets(markdown, 0, image_paths)
+    return apply_page_assets(markdown, page_number, image_paths)
+
+
+def retain_extracted_image_blocks(
+    typed_blocks: list[tuple[str, BoundingBox]], accepted_images: list[BoundingBox]
+) -> list[tuple[str, BoundingBox]]:
+    """Keep image blocks only when a corresponding crop survived filtering.
+
+    OCR still receives the complete page. This prevents a broad layout image
+    box (for example a stamp overlapping a printed name) from suppressing text
+    after that graphical crop has intentionally been rejected.
+    """
+    accepted = set(accepted_images)
+    return [
+        (kind, bbox) for kind, bbox in typed_blocks
+        if kind != "image" or bbox in accepted
+    ]
+
+
+def normalized_document_stem(pdf_path: Path) -> str:
+    """Return the source stem in composed Unicode without ASCII slugging."""
+    return unicodedata.normalize("NFC", pdf_path.stem)
+
+
+def output_markdown_path(output_dir: Path, pdf_path: Path) -> Path:
+    """Build an output filename while preserving Vietnamese Unicode."""
+    return output_dir / f"{normalized_document_stem(pdf_path)}.md"
 
 
 # Hàm chính xử lý OCR cho một tệp PDF đơn lẻ
-def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_name: str, workers: int = 1):
+def process_single_pdf(
+    pdf_path: Path, output_dir: Path, client: Client, model_name: str,
+    workers: int = 1,
+):
     """
     Tiến hành lập trình tự render và nhận diện OCR toàn bộ tệp PDF:
     - Khởi tạo thư mục và quét số trang.
@@ -1010,8 +1492,15 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
         raise ValueError("workers must be at least 1")
     workers = normalize_worker_count(workers, model_name)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{pdf_path.stem}.md"
-    temp_output_path = output_dir / f"{pdf_path.stem}.md.tmp"
+    output_path = output_markdown_path(output_dir, pdf_path)
+    temp_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    print(f"\nProcessing: {pdf_path.name} -> {output_path.name}")
+    document_started_at = perf_counter()
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        total_pages = pdf_page_count(pdf_path)
+        print(f"Pipelining render and OCR for {total_pages} pages (workers={workers})...")
     print(f"\nProcessing: {pdf_path.name} -> {output_path.name}")
     document_started_at = perf_counter()
 
@@ -1022,10 +1511,10 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
         from app.core.formula_ocr import formula_ocr_status
         _, formula_status = formula_ocr_status()
         print(f"Formula OCR status: {formula_status}.")
-        
+
         import threading
         from concurrent.futures import ThreadPoolExecutor
-        
+
         render_timings: dict[Path, float] = {}
         layout_lock = threading.Lock()
         is_hybrid = "hybrid" in model_name.lower()
@@ -1043,7 +1532,7 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
         def process_page_worker(idx_img):
             idx, img_path = idx_img
             page_num = idx + 1
-            
+
             print(f"OCR'ing page {page_num}/{total_pages}: {img_path.name}...")
             started_at = perf_counter()
 
@@ -1088,16 +1577,27 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             # 1. Trích xuất hình ảnh vật lý từ trang PDF
             extracted_img_paths = []
             try:
+                if TEXT_ONLY_OUTPUT:
+                    if page_analysis is not None:
+                        page_analysis.images.clear()
+                    raise StopIteration
                 output_img_dir = output_dir / "images"
                 extracted_img_paths = extract_images_from_page(
-                    pdf_path, idx, output_img_dir, pdf_path.stem,
+                    pdf_path, idx, output_img_dir, normalized_document_stem(pdf_path),
                     layout_detector=layout_detector,
                     page_image_path=img_path,
                     segments=segments,
                     detected_images=page_analysis.images if page_analysis else [],
                 )
+            except StopIteration:
+                pass
             except Exception as img_err:
                 print(f"    -> [Warning] Failed to extract images: {img_err}")
+
+            if page_analysis is not None:
+                ordered_blocks = retain_extracted_image_blocks(
+                    ordered_blocks, page_analysis.images
+                )
 
             # 1.5. Trích xuất công thức toán học từ trang PDF bằng LaTeX-OCR
             formulas_latex = []
@@ -1114,15 +1614,15 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                                     if left <= center_x <= right and top <= center_y <= bottom:
                                         return seg_idx
                             return 0
-                        
+
                         formulas_with_keys = []
                         for bbox in detected_formulas:
                             seg_idx = get_segment_idx(bbox)
                             formulas_with_keys.append((bbox, (seg_idx, bbox[1], bbox[0])))
                         formulas_with_keys.sort(key=lambda item: item[1])
-                        
+
                         from app.core.formula_ocr import recognize_formula
-                        
+
                         with Image.open(img_path) as image:
                             for idx_f, (bbox, _) in enumerate(formulas_with_keys, 1):
                                 left, top, right, bottom = map(int, bbox)
@@ -1130,12 +1630,12 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                                 top = max(0, top - 4)
                                 right = min(image.width, right + 4)
                                 bottom = min(image.height, bottom + 4)
-                                
+
                                 crop_img = image.crop((left, top, right, bottom))
                                 buf = BytesIO()
                                 crop_img.save(buf, format="PNG")
                                 latex_bytes = buf.getvalue()
-                                
+
                                 latex_str = recognize_formula(latex_bytes)
                                 if latex_str:
                                     height = bottom - top
@@ -1161,6 +1661,7 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                 page_md = ocr_coordinate_blocks(
                     client, qwen_model, img_path, ordered_blocks, extracted_img_paths,
                     temp_dir_path / "layout_blocks" / f"page_{page_num}",
+                    page_number=page_num,
                     log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
                 )
                 if page_md is not None:
@@ -1183,29 +1684,36 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             if page_md:
                 page_md = apply_page_assets(page_md, page_num, extracted_img_paths, formulas_latex)
 
-            # 3. Quality gate: retry only this page once from the original full-page image.
+            # 3. Quality gate: retry only this page once when under quality threshold.
             if not error:
                 from app.core.quality_gate import choose_best_page, evaluate_page
                 report = evaluate_page(page_md, output_dir, check_tables=has_table)
+                errors_str = f"Errors: {', '.join(report.errors)}" if report.errors else "No errors"
+                warnings_str = f", Warnings: {', '.join(report.warnings)}" if report.warnings else ""
+                print(f"    -> [Quality Gate Page {page_num}] Score: {report.score}/100.0 ({errors_str}{warnings_str})")
                 if report.warnings:
                     print(f"    -> [Warning] Page {page_num}: {', '.join(report.warnings)}")
-                if not report.passed:
+                if report.should_retry:
                     initial_md, initial_report = page_md, report
-                    print(f"    -> Quality retry page {page_num}: {', '.join(report.errors)}")
+                    print(f"    -> Quality retry page {page_num} (Score: {report.score}/100 < threshold or fatal): {', '.join(report.errors)}")
                     retry_started_at = perf_counter()
                     try:
                         retry_md = ocr_qwen_images(
                             client, qwen_model, [img_path], has_table=has_table,
-                            extra_instruction="\n\n" + QUALITY_RETRY_INSTRUCTION.format(errors=", ".join(report.errors)),
+                            extra_instruction="\n\n" + quality_retry_instruction(initial_md, ", ".join(report.errors)),
                             log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
                         )
                         retry_md = apply_page_assets(retry_md, page_num, extracted_img_paths, formulas_latex)
                         second_report = evaluate_page(retry_md, output_dir, check_tables=has_table)
+                        second_errors_str = f"Errors: {', '.join(second_report.errors)}" if second_report.errors else "No errors"
+                        second_warnings_str = f", Warnings: {', '.join(second_report.warnings)}" if second_report.warnings else ""
+                        print(f"    -> [Quality Gate Retry Page {page_num}] Score: {second_report.score}/100.0 ({second_errors_str}{second_warnings_str})")
                         if second_report.warnings:
                             print(f"    -> [Warning] Retry page {page_num}: {', '.join(second_report.warnings)}")
                         page_md, report = choose_best_page(
                             initial_md, initial_report, retry_md, second_report
                         )
+
                     except Exception as retry_error:
                         page_md, report = initial_md, initial_report
                         print(f"    -> [Warning] Quality retry failed on page {page_num}; keeping original result: {retry_error}")
@@ -1217,6 +1725,10 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                             f"({', '.join(report.errors)}); using best result and continuing."
                         )
 
+            removed_assets = cleanup_unreferenced_assets(page_md, extracted_img_paths, output_dir)
+            if removed_assets:
+                print(f"    -> Removed {removed_assets} unreferenced extracted image(s) from page {page_num}.")
+
             qwen_seconds = perf_counter() - qwen_started_at if 'qwen_started_at' in locals() else qwen_seconds
             elapsed = perf_counter() - started_at
             print(
@@ -1225,17 +1737,37 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
                 f"Formula OCR {formula_seconds:.1f}s"
             )
             print(f"Page {page_num} done in {elapsed:.1f}s.")
+            review_regions[page_num] = [bbox for kind, bbox in ordered_blocks if kind != "image"]
             return page_num, page_md, error
 
         # Gửi tác vụ OCR ngay khi từng trang được render xong
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = []
-            for index, image_path in enumerate(iter_render_pdf_to_images(pdf_path, temp_dir_path, dpi=150, render_timings=render_timings)):
+            page_image_paths: dict[int, Path] = {}
+            review_regions: dict[int, list[BoundingBox]] = {}
+            for index, image_path in enumerate(iter_render_pdf_to_images(pdf_path, temp_dir_path, dpi=300, render_timings=render_timings)):
+                page_image_paths[index + 1] = image_path
                 futures.append(executor.submit(process_page_worker, (index, image_path)))
             results = [future.result() for future in futures]
-            
+
         # Sắp xếp lại theo đúng thứ tự số trang ban đầu
         results.sort(key=lambda x: x[0])
+        from app.core.image_grounded_review import review_suspicious_lines
+        reviewed_results = []
+        for page_num, page_md, error in results:
+            if page_md and not error:
+                try:
+                    page_md = review_suspicious_lines(
+                        client, resolve_qwen_model(model_name), page_image_paths[page_num], page_md,
+                        temp_dir_path / "review_crops" / f"page_{page_num}",
+                        log_func=lambda message, number=page_num: print(f"    -> [Page {number}] {message}"),
+                        regions=review_regions.get(page_num),
+                        review_document_footer=page_num == total_pages,
+                    )
+                except Exception as review_error:
+                    print(f"    -> [Warning] Image-grounded review failed on page {page_num}; kept OCR result: {review_error}")
+            reviewed_results.append((page_num, page_md, error))
+        results = reviewed_results
         from app.core.quality_gate import validate_page_numbers
         page_report = validate_page_numbers([page_num for page_num, _, _ in results], total_pages)
         if not page_report.passed:
@@ -1246,10 +1778,14 @@ def process_single_pdf(pdf_path: Path, output_dir: Path, client: Client, model_n
             raise RuntimeError(f"OCR failed; existing output was preserved ({details})")
 
         ocr_contents = [f"<!-- Page {p_num} -->\n\n{p_md}" for p_num, p_md, _ in results]
-            
+
         final_md = "\n\n".join(ocr_contents) + "\n"
+        finalization_report = {"spelling_warnings": []}
         try:
-            final_md = finalize_markdown(final_md)
+            final_md, finalization_report = finalize_markdown(final_md, return_report=True)
+            print("    -> Hậu xử lý Markdown:")
+            for report_line in format_finalization_report(finalization_report):
+                print(f"       - {report_line}")
         except Exception as merge_err:
             print(f"    -> [Warning] Failed to finalize Markdown: {merge_err}")
         write_started_at = perf_counter()
@@ -1277,11 +1813,11 @@ def main():
 
     input_path = args.input if args.input else "PDF"
     output_path = args.output if args.output else "OCR"
-    
+
     target_path = Path(input_path).resolve()
     ocr_dir = Path(output_path).resolve()
     ocr_dir.mkdir(parents=True, exist_ok=True)
-    
+
     pdf_files = []
     if target_path.is_file() and target_path.suffix.lower() == ".pdf":
         pdf_files.append(target_path)
@@ -1303,15 +1839,15 @@ def main():
             else:
                 print("No sample PDFs found. Please place PDF files in the input directory.")
                 sys.exit(0)
-            
+
     print(f"Found {len(pdf_files)} PDF files to process.")
     print(f"Using model: {args.model}")
     client = Client(host="http://localhost:11434", timeout=60.0)
-    
+
     total_start = perf_counter()
     for pdf_file in pdf_files:
         process_single_pdf(pdf_file, ocr_dir, client, args.model, workers=args.workers)
-        
+
     total_elapsed = perf_counter() - total_start
     print(f"\nBatch OCR processing completed in {total_elapsed:.1f} seconds.")
 
