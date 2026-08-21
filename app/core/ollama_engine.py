@@ -159,15 +159,8 @@ class OllamaQwenEngine:
         import re
         text = text.strip()
 
-        if text.startswith("```markdown"):
-            text = text[len("```markdown"):]
-
-        elif text.startswith("```"):
-            text = text[3:]
-
-        if text.endswith("```"):
-            text = text[:-3]
-
+        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\r?\n?", "", text)
+        text = re.sub(r"\r?\n?```\s*$", "", text)
         text = text.strip()
 
         # Dọn dẹp các thực thể khoảng trắng HTML

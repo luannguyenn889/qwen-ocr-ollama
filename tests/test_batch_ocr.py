@@ -9,15 +9,97 @@ from unittest.mock import Mock, patch
 
 from app.core.batch_ocr import (
     MODEL, PROMPT, TEXT_ONLY_OUTPUT, QUALITY_RETRY_INSTRUCTION, TABLE_STRUCTURE_REPAIR_PROMPT,
-    clean_markdown, finalize_markdown, link_extracted_images, needs_table_retry,
+    clean_markdown, detect_and_rotate_page, finalize_markdown, generate_with_retry, link_extracted_images, merge_markdown_tables, needs_table_retry,
     needs_vision_retry, normalize_worker_count, output_markdown_path, page_is_tiled_scan, process_single_pdf,
     quality_retry_instruction, repair_markdown_tables,
 )
 
 
 class BatchOcrTests(unittest.TestCase):
+    def test_detect_and_rotate_page_applies_classifier_angle(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "landscape.png"
+            Image.new("RGB", (80, 40), "white").save(image_path)
+            with patch("app.core.batch_ocr.detect_text_orientation", return_value=90):
+                oriented = detect_and_rotate_page(image_path)
+            try:
+                self.assertEqual(oriented.size, (40, 80))
+            finally:
+                oriented.close()
+
     def test_content_image_output_is_enabled(self):
         self.assertFalse(TEXT_ONLY_OUTPUT)
+
+    def test_graphic_classifier_does_not_transcribe_content(self):
+        from app.core.batch_ocr import classify_graphic_crop
+        with tempfile.TemporaryDirectory() as directory:
+            crop = Path(directory) / "crop.png"
+            from PIL import Image
+            Image.new("RGB", (1800, 1200), "white").save(crop)
+            client = Mock()
+            client.generate.return_value = SimpleNamespace(
+                response='{"category":"signature","confidence":0.99}'
+            )
+            category, confidence = classify_graphic_crop(client, "model", crop)
+        self.assertEqual((category, confidence), ("signature", 0.99))
+        self.assertIn("không OCR", client.generate.call_args.kwargs["prompt"])
+        self.assertEqual(client.generate.call_args.kwargs["options"]["num_ctx"], 8192)
+        self.assertFalse(any(Path(directory).glob("*.classify_*.jpg")))
+
+    def test_graphic_context_error_retries_once_with_smaller_crop(self):
+        from app.core.batch_ocr import classify_graphic_crop
+        with tempfile.TemporaryDirectory() as directory:
+            crop = Path(directory) / "crop.png"
+            from PIL import Image
+            Image.new("RGB", (2000, 1600), "white").save(crop)
+            client = Mock()
+            client.generate.side_effect = [
+                RuntimeError("exceed_context_size_error"),
+                SimpleNamespace(response='{"category":"content_image","confidence":0.99}'),
+            ]
+            category, confidence = classify_graphic_crop(
+                client, "model", crop, log_func=lambda _message: None,
+            )
+            sent_images = [call.kwargs["images"][0] for call in client.generate.call_args_list]
+        self.assertEqual((category, confidence), ("content_image", 0.99))
+        self.assertEqual(client.generate.call_count, 2)
+        self.assertIn("classify_1024", sent_images[0])
+        self.assertIn("classify_768", sent_images[1])
+
+    def test_graphic_is_deleted_only_at_strict_confidence(self):
+        from app.core.batch_ocr import _discard_classified_graphic
+        self.assertTrue(_discard_classified_graphic("signature", 0.98))
+        self.assertTrue(_discard_classified_graphic("stamp", 0.99))
+        self.assertFalse(_discard_classified_graphic("signature", 0.97))
+        self.assertFalse(_discard_classified_graphic("uncertain", 1.0))
+        self.assertFalse(_discard_classified_graphic("content_image", 1.0))
+        self.assertFalse(_discard_classified_graphic("logo", 1.0))
+
+    def test_only_byte_identical_assets_are_deduplicated(self):
+        from app.core.batch_ocr import deduplicate_exact_assets
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "images").mkdir()
+            (root / "images/a.png").write_bytes(b"same")
+            (root / "images/b.png").write_bytes(b"same")
+            markdown = "![A](images/a.png)\n\n![B](images/b.png)"
+            result, paths, removed = deduplicate_exact_assets(
+                markdown, ["images/a.png", "images/b.png"], root,
+            )
+        self.assertEqual(paths, ["images/a.png"])
+        self.assertEqual(removed, 1)
+        self.assertNotIn("images/b.png", result)
+        self.assertEqual(result.count("!["), 1)
+
+    def test_ollama_timeout_retries_twice_after_initial_attempt(self):
+        client = Mock()
+        client.generate.side_effect = TimeoutError("request timed out")
+        with patch("app.core.batch_ocr.time.sleep"):
+            with self.assertRaises(TimeoutError):
+                generate_with_retry(client, {}, log_func=lambda _message: None)
+        self.assertEqual(client.generate.call_count, 3)
 
     def test_all_generation_prompts_forbid_answering_exam_questions(self):
         combined = "\n".join((PROMPT, QUALITY_RETRY_INSTRUCTION, TABLE_STRUCTURE_REPAIR_PROMPT)).casefold()
@@ -78,6 +160,66 @@ class BatchOcrTests(unittest.TestCase):
         self.assertIn("| 3 | 1,5 |", repaired)
         self.assertLess(repaired.index("| 1 |"), repaired.index("| 2 |"))
 
+    def test_numbered_table_continuation_merges_after_empty_trailing_column(self):
+        markdown = (
+            "| 11 | A | Đơn vị A | Đề tài A | GV A |  |\n"
+            "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+            "| 12 | B | Đơn vị B | Đề tài B | GV B |  |\n\n"
+            "<!-- Page 4 -->\n\n"
+            "| 13 | C | Đơn vị C | Đề tài C | GV C |\n"
+            "| :--- | :--- | :--- | :--- | :--- |\n"
+            "| 14 | D | Đơn vị D | Đề tài D | GV D |"
+        )
+        repaired = merge_markdown_tables(markdown)
+        self.assertEqual(repaired.count("| :--- | :--- | :--- | :--- | :--- |"), 1)
+        self.assertIn("| 12 | B | Đơn vị B | Đề tài B | GV B |", repaired)
+        self.assertIn("| 13 | C | Đơn vị C | Đề tài C | GV C |", repaired)
+
+    def test_lettered_table_continuation_is_not_number_specific(self):
+        markdown = (
+            "| Mục | Nội dung |\n| :--- | :--- |\n| A | Một |\n\n"
+            "<!-- Page 2 -->\n\n| B | Hai |\n| :--- | :--- |\n| C | Ba |"
+        )
+        repaired = merge_markdown_tables(markdown)
+        self.assertEqual(repaired.count("| :--- | :--- |"), 1)
+        self.assertLess(repaired.index("| A |"), repaired.index("| B |"))
+
+    def test_html_document_wrapper_does_not_split_markdown_table(self):
+        markdown = (
+            "| Mục | Nội dung |\n| :--- | :--- |\n| 12 | Trước |\n\n"
+            "<!-- Page 2 -->\n<html>\n<body>\n\n"
+            "| 13 | Sau |\n| :--- | :--- |\n| 14 | Cuối |\n\n</body>\n</html>"
+        )
+        repaired = merge_markdown_tables(markdown)
+        self.assertEqual(repaired.count("| :--- | :--- |"), 1)
+        self.assertNotIn("<html>", repaired.casefold())
+        self.assertLess(repaired.index("| 12 |"), repaired.index("| 13 |"))
+
+    def test_inline_html_wrapper_does_not_split_markdown_table(self):
+        markdown = (
+            "| Mục | Nội dung |\n| :--- | :--- |\n| 1 | Trước |\n\n"
+            "<html><body>| 2 | Sau |\n| :--- | :--- |\n| 3 | Cuối |</body></html>"
+        )
+        repaired = merge_markdown_tables(markdown)
+        self.assertNotRegex(repaired.casefold(), r"</?(?:html|body)\b")
+        self.assertEqual(repaired.count("| :--- | :--- |"), 1)
+
+    def test_doctype_wrapper_does_not_turn_continuation_row_into_header(self):
+        markdown = (
+            "| STT | Họ tên | Nội dung |\n"
+            "| :--- | :--- | :--- |\n"
+            "| 9 | Người A | Trước |\n\n"
+            "<!-- Page 3 -->\n\n<!DOCTYPE html>\n\n"
+            "| 10 | Người B | Sau |\n"
+            "| :--- | :--- | :--- |\n"
+            "| 11 | Người C | Cuối |"
+        )
+        repaired = merge_markdown_tables(markdown)
+        self.assertNotIn("doctype", repaired.casefold())
+        self.assertEqual(repaired.count("| :--- | :--- | :--- |"), 1)
+        self.assertLess(repaired.index("| 9 |"), repaired.index("| 10 |"))
+        self.assertLess(repaired.index("| 10 |"), repaired.index("| 11 |"))
+
     def test_html_tables_merge_across_page_figure(self):
         markdown = (
             "<table><tr><td>Một</td></tr></table>\n<!-- Page 2 -->\n"
@@ -96,6 +238,34 @@ class BatchOcrTests(unittest.TestCase):
         repaired = finalize_markdown("<table><tr><td>-$</td>$<td>$</td>$</tr></table>")
         self.assertIn("<td>$-$</td><td></td>", repaired)
         self.assertNotIn("</td>$<td>", repaired)
+
+    def test_html_table_continuation_does_not_render_as_indented_code(self):
+        markdown = (
+            "<table>\n<tr><td>STT</td><td>Họ tên</td><td>Ghi chú</td></tr>\n"
+            "\t<tr><td>12</td><td>A</td><td></td></tr>\n\n"
+            "\t<tr>\n\t\t<td>13</td>\n\t\t<td>B</td>\n\t</tr>\n</table>"
+        )
+        repaired = finalize_markdown(markdown)
+        self.assertIn("| 13 | B |  |", repaired)
+        self.assertNotIn("<tr>", repaired)
+        self.assertNotRegex(repaired, r"(?m)^[ \t]{4,}<td>")
+
+    def test_markdown_table_merges_with_html_continuation_after_conversion(self):
+        markdown = (
+            "| STT | Họ tên | Đơn vị | Đề tài | Hướng dẫn | Ghi chú |\n"
+            "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+            "| 05 | A | X | Đề tài A | GV A |  |\n\n"
+            "<!-- Page 3 -->\n\n"
+            "<table><tr><td>06</td><td>B</td><td>Y</td><td>Đề tài B</td>"
+            "<td>GV B</td><td></td></tr>"
+            "<tr><td>07</td><td>C</td><td>Z</td><td>Đề tài C</td>"
+            "<td>GV C</td><td></td></tr></table>"
+        )
+        repaired = finalize_markdown(markdown)
+        self.assertEqual(repaired.count("| STT | Họ tên |"), 1)
+        self.assertEqual(repaired.count("| :--- | :--- | :--- | :--- | :--- | :--- |"), 1)
+        self.assertIn("| 06 | B | Y | Đề tài B | GV B |  |", repaired)
+        self.assertIn("| 07 | C | Z | Đề tài C | GV C |  |", repaired)
 
     def test_magazine_footer_and_preceding_page_number_are_removed(self):
         markdown = (
@@ -217,6 +387,27 @@ class BatchOcrTests(unittest.TestCase):
         markdown = "| Cú pháp | Mô tả |\n|---|---|\n| `a|b` | lựa chọn |"
         self.assertEqual(repair_markdown_tables(markdown), markdown)
 
+    def test_merge_markdown_tables_with_pseudo_header_continuation(self):
+        table_page_1 = (
+            "| STT | Họ và tên | Đơn vị |\n"
+            "| :--- | :--- | :--- |\n"
+            "| 1 | Nguyễn Văn A | Hà Nội |\n"
+            "| 2 | Trần Thị B | Đà Nẵng |"
+        )
+        table_page_2 = (
+            "| 3 | Lê Văn C | TP.HCM |\n"
+            "| :--- | :--- | :--- |\n"
+            "| 4 | Phạm Thị D | Cần Thơ |"
+        )
+        content = f"{table_page_1}\n\n<!-- Page 2 -->\n\n{table_page_2}"
+        merged = merge_markdown_tables(content)
+        self.assertEqual(content.count("| :--- | :--- | :--- |"), 2)
+        self.assertEqual(merged.count("| :--- | :--- | :--- |"), 1)
+        self.assertIn("| 1 | Nguyễn Văn A | Hà Nội |", merged)
+        self.assertIn("| 2 | Trần Thị B | Đà Nẵng |", merged)
+        self.assertIn("| 3 | Lê Văn C | TP.HCM |", merged)
+        self.assertIn("| 4 | Phạm Thị D | Cần Thơ |", merged)
+
     def test_finalizer_normalizes_heading_and_paragraph_breaks(self):
         malformed = "#Tiêu đề\n\n####Mục con\n\nĐây là một câu bị\nngắt giữa dòng."
         repaired = finalize_markdown(malformed)
@@ -330,6 +521,17 @@ class BatchOcrTests(unittest.TestCase):
         self.assertNotIn("- 1 -", repaired)
         self.assertNotIn("[ 2 ]", repaired)
 
+    def test_rotated_page_footer_number_is_removed_at_start_of_page_block(self):
+        markdown = (
+            "<!-- Page 2 -->\n| Stt | Họ và tên |\n| --- | --- |\n| 12 | A |\n\n"
+            "<!-- Page 3 -->\n\n2\n\n"
+            "| Stt | Họ và tên |\n| --- | --- |\n| 13 | B |"
+        )
+        repaired, report = finalize_markdown(markdown, return_report=True)
+        self.assertNotIn("\n2\n", f"\n{repaired}\n")
+        self.assertIn("| 13 | B |", repaired)
+        self.assertEqual(report["page_artifacts_removed"], 1)
+
 
 
 
@@ -346,15 +548,39 @@ class BatchOcrTests(unittest.TestCase):
         self.assertIn("images/one.png", linked)
         self.assertEqual(remaining, ["images/two.png"])
 
-    def test_unplaced_assets_are_not_appended_at_page_end(self):
+    def test_finalizer_removes_all_orphan_image_placeholder_forms(self):
+        markdown = (
+            "Trước\n\n![Thiếu](images/image_placeholder.png)\n\n"
+            '<img alt="Thiếu" src="image_placeholder.jpg">\n\n'
+            "image_placeholder\n\n![Giữ](images/real.png)\n\nSau"
+        )
+        repaired = finalize_markdown(markdown)
+        self.assertNotIn("image_placeholder", repaired.casefold())
+        self.assertNotIn("<img", repaired.casefold())
+        self.assertIn("![Giữ](images/real.png)", repaired)
+        self.assertIn("Trước", repaired)
+        self.assertIn("Sau", repaired)
+
+    def test_page_asset_cleanup_uses_path_aware_placeholder_pattern(self):
+        from app.core.batch_ocr import apply_page_assets
+
+        repaired = apply_page_assets(
+            "![Image](images/image_placeholder.png)\n\n"
+            "![App](./image_placeholder)\n\nNội dung",
+            1, [],
+        )
+        self.assertNotIn("image_placeholder", repaired.casefold())
+        self.assertEqual(repaired, "Nội dung")
+
+    def test_unplaced_assets_are_preserved_at_page_end(self):
         from app.core.batch_ocr import apply_page_assets
 
         result = apply_page_assets(
             "Nội dung trang", 1,
             ["images/report_page_1_draw_2.png", "images/report_page_1_img_1.png"],
         )
-        self.assertNotIn("draw_2.png", result)
-        self.assertNotIn("img_1.png", result)
+        self.assertIn("draw_2.png", result)
+        self.assertIn("img_1.png", result)
 
     def test_cleanup_removes_only_unreferenced_local_assets(self):
         from app.core.batch_ocr import cleanup_unreferenced_assets
@@ -384,14 +610,14 @@ class BatchOcrTests(unittest.TestCase):
         )
         self.assertIn("draw_2.png", result)
 
-    def test_unplaced_bitmaps_with_coordinates_are_not_interleaved(self):
+    def test_unplaced_bitmaps_are_preserved_without_layout_blocks(self):
         from app.core.batch_ocr import apply_page_assets
 
         images = ["images/top_img_1.png", "images/bottom_img_2.png"]
         markdown = "Đoạn văn đầu tiên của trang.\n\nĐoạn văn ở giữa trang.\n\nĐoạn văn cuối trang."
         result = apply_page_assets(markdown, 1, images)
-        self.assertNotIn("top_img_1.png", result)
-        self.assertNotIn("bottom_img_2.png", result)
+        self.assertIn("top_img_1.png", result)
+        self.assertIn("bottom_img_2.png", result)
 
     def test_coordinate_fallback_does_not_insert_inside_table(self):
         from app.core.batch_ocr import apply_page_assets
@@ -399,7 +625,8 @@ class BatchOcrTests(unittest.TestCase):
         images = ["images/figure_img_1.png"]
         markdown = "Đoạn mở đầu.\n\n<table><tr><td>Dữ liệu</td></tr></table>\n\nĐoạn kết thúc."
         result = apply_page_assets(markdown, 1, images)
-        self.assertNotIn("figure_img_1.png", result)
+        self.assertIn("figure_img_1.png", result)
+        self.assertGreater(result.index("figure_img_1.png"), result.index("</table>"))
 
     def test_vector_line_and_margin_filter(self):
         from app.core.batch_ocr import _keep_vector_drawing
@@ -419,22 +646,25 @@ class BatchOcrTests(unittest.TestCase):
         self.assertTrue(_keep_vector_drawing(rect(100, 100, 240, 180), 600, 800))
 
     def test_full_page_canvas_filter_uses_eighty_percent_threshold(self):
+        # pyrefly: ignore [missing-import]
         import pymupdf
         from app.core.batch_ocr import _is_full_page_canvas
 
         self.assertTrue(_is_full_page_canvas(pymupdf.Rect(0, 0, 600, 760), 600, 800))
         self.assertFalse(_is_full_page_canvas(pymupdf.Rect(0, 0, 300, 400), 600, 800))
 
-    def test_bottom_signature_filter_requires_signature_context_and_no_caption(self):
+    def test_uncaptioned_graphic_requires_classification_at_any_position(self):
+        # pyrefly: ignore [missing-import]
         import pymupdf
-        from app.core.batch_ocr import _is_bottom_signature_or_stamp
+        from app.core.batch_ocr import _needs_graphic_classification
 
         page = SimpleNamespace(rect=pymupdf.Rect(0, 0, 600, 800))
-        page.get_text = lambda _kind: [(350, 690, 520, 715, "CHỦ", 0, 0, 0), (350, 715, 520, 740, "TỊCH", 0, 0, 1)]
-        self.assertTrue(_is_bottom_signature_or_stamp(page, pymupdf.Rect(360, 650, 520, 780)))
+        page.get_text = lambda _kind: []
+        self.assertTrue(_needs_graphic_classification(page, pymupdf.Rect(360, 650, 520, 780)))
+        self.assertTrue(_needs_graphic_classification(page, pymupdf.Rect(60, 50, 220, 180)))
 
         page.get_text = lambda _kind: [(350, 690, 520, 715, "Hình", 0, 0, 0), (350, 715, 520, 740, "2", 0, 0, 1)]
-        self.assertFalse(_is_bottom_signature_or_stamp(page, pymupdf.Rect(360, 650, 520, 780)))
+        self.assertFalse(_needs_graphic_classification(page, pymupdf.Rect(360, 650, 520, 780)))
 
     def test_tiled_scan_is_not_treated_as_many_figures(self):
         pdf_path = Path(__file__).resolve().parent.parent / "PDF" / "de-van.pdf"
@@ -494,7 +724,10 @@ class BatchOcrTests(unittest.TestCase):
 
             self.assertEqual(client.generate.call_args.kwargs["model"], MODEL)
             self.assertEqual(client.generate.call_args.kwargs["images"], [str(image_path)])
-            self.assertEqual(result.read_text(encoding="utf-8"), "<!-- Page 1 -->\n\n# Result")
+            self.assertEqual(
+                result.read_text(encoding="utf-8"),
+                "<!-- Page 1 -->\n\n# Result\n\n![Hình ảnh](images/figure.png)",
+            )
 
     def test_two_workers_keep_original_page_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -615,6 +848,7 @@ class BatchOcrTests(unittest.TestCase):
             root = Path(directory)
             pdf_path = root / "source.pdf"
             page_image_path = root / "page.png"
+            # pyrefly: ignore [missing-import]
             from PIL import Image
             Image.new("RGB", (1000, 1000), "white").save(page_image_path)
 
@@ -641,6 +875,32 @@ class BatchOcrTests(unittest.TestCase):
 
             self.assertEqual(result, [])
             self.assertEqual(detected_images, [])
+
+    def test_layout_image_overlapping_table_is_not_extracted(self):
+        from app.core.batch_ocr import extract_images_from_page
+        from unittest.mock import MagicMock, patch
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            page_image = root / "page.png"
+            Image.new("RGB", (1000, 1000), "white").save(page_image)
+            images = [(100.0, 100.0, 900.0, 800.0)]
+            page = MagicMock()
+            page.rect = MagicMock(width=500, height=500)
+            page.get_images.return_value = []
+            page.get_drawings.return_value = []
+            document = MagicMock()
+            document.load_page.return_value = page
+            with patch("pymupdf.open", return_value=document):
+                result = extract_images_from_page(
+                    root / "source.pdf", 0, root / "images", "sample",
+                    layout_detector=MagicMock(), page_image_path=page_image,
+                    detected_images=images,
+                    table_regions=[(80.0, 80.0, 920.0, 820.0)],
+                )
+        self.assertEqual(result, [])
+        self.assertEqual(images, [])
 
     def test_image_crop_padding_is_proportional_and_clamped(self):
         from app.core.batch_ocr import _padded_box
@@ -681,6 +941,7 @@ class BatchOcrTests(unittest.TestCase):
             patch("app.core.batch_ocr.extract_images_from_page", return_value=[])
         ):
             # Write a dummy page_1.png
+            # pyrefly: ignore [missing-import]
             from PIL import Image
             img = Image.new("RGB", (1000, 1000), "white")
             img_path = Path(temp_dir) / "page_1.png"

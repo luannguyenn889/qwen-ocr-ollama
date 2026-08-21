@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from app.core.block_assembler import DocumentBlock, assemble_blocks
+from app.core.block_assembler import DocumentBlock, assemble_blocks, assemble_blocks_with_spans
 from app.core.batch_ocr import (
     PROMPT, apply_page_assets, ocr_coordinate_blocks,
     retain_extracted_image_blocks,
@@ -12,6 +12,16 @@ from app.core.batch_ocr import (
 
 
 class BlockAssemblerTests(unittest.TestCase):
+    def test_assembly_records_exact_block_offsets_and_bbox(self):
+        first = DocumentBlock("text", (0, 0, 100, 20))
+        second = DocumentBlock("text", (0, 30, 100, 50))
+        markdown, spans = assemble_blocks_with_spans(
+            [first, second], {first.bbox: "Một", second.bbox: "Hai"}, [], page_number=2,
+        )
+        self.assertEqual(markdown[spans[1].markdown_start:spans[1].markdown_end], "Hai")
+        self.assertEqual(spans[1].block_id, "page_2_block_002")
+        self.assertEqual(spans[1].bbox, second.bbox)
+        self.assertEqual(spans[1].mapping_confidence, "exact")
     def test_filtered_graphic_block_cannot_suppress_overlapping_text(self):
         text = ("text", (10.0, 10.0, 90.0, 30.0))
         rejected_stamp = ("image", (0.0, 0.0, 100.0, 100.0))
@@ -79,7 +89,7 @@ class BlockAssemblerTests(unittest.TestCase):
         self.assertLess(markdown.index("Đoạn trước"), markdown.index("images/figure.png"))
         self.assertLess(markdown.index("images/figure.png"), markdown.index("Đoạn sau"))
 
-    def test_coordinate_ocr_does_not_insert_unrequested_image(self):
+    def test_coordinate_ocr_inserts_layout_image_without_placeholder(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             page = root / "page.png"
@@ -92,7 +102,7 @@ class BlockAssemblerTests(unittest.TestCase):
                 [("text", (0, 0, 100, 40)), ("image", (0, 50, 100, 100))],
                 ["images/figure.png"], root / "blocks", page_number=3,
             )
-        self.assertNotIn("images/figure.png", markdown)
+        self.assertIn("images/figure.png", markdown)
 
     def test_model_zero_based_generic_alt_is_corrected(self):
         result = apply_page_assets(
@@ -136,7 +146,7 @@ class BlockAssemblerTests(unittest.TestCase):
         result = apply_page_assets(markdown, 1, ["images/new.png"])
         self.assertIn("images/existing.png", result)
         self.assertIn("https://example.com/photo.png", result)
-        self.assertNotIn("images/new.png", result)
+        self.assertIn("images/new.png", result)
 
 
 if __name__ == "__main__":

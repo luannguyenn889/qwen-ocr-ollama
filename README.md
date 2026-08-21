@@ -10,6 +10,10 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
    * Mỗi tài liệu tạo một file `<tên-tài-liệu>.md`; ảnh nội dung thực sự được lưu trong thư mục `images/` và liên kết từ Markdown.
    * Crop hậu kiểm, overlay layout và nhật ký hiệu chỉnh chỉ tồn tại tạm thời rồi được xoá.
    * Không chèn ảnh chữ ký/con dấu; chữ in đọc được xung quanh vẫn được giữ.
+   * Ảnh nội dung được đặt theo reading order của layout ngay cả khi Qwen quên tạo `image_placeholder`.
+   * Vùng đồ họa cuối trang không rõ loại được Qwen phân loại riêng mà không OCR nội dung; chỉ chữ ký/con dấu có độ tin cậy tối thiểu `0.98` mới bị loại.
+   * Ảnh phân loại được thu tạm xuống tối đa 1024 px với `num_ctx=4096`; nếu vẫn vượt context, hệ thống thử lại một lần ở 768 px rồi giữ ảnh nếu chưa phân loại được.
+   * Chỉ gộp ảnh trùng khi dữ liệu tệp giống hoàn toàn; ảnh gần giống hoặc chưa chắc chắn vẫn được giữ.
 2. **Gộp bảng thông minh qua ranh giới trang (Smart Table Merger)**:
    * Tự động phát hiện và gộp các bảng Markdown bị phân cắt qua ranh giới trang (ví dụ bảng kéo dài từ trang trước sang trang sau).
    * Loại bỏ các dòng tiêu đề trùng lặp và khoảng trắng thừa, hợp nhất dữ liệu thành một bảng lớn duy nhất chuẩn Markdown.
@@ -28,13 +32,38 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
 6. **Theo dõi hiệu năng trong log**:
    * Hiển thị thời gian render, phân tích Paddle và Qwen theo từng trang.
    * GUI ghi tổng thời gian từng file và toàn bộ đợt OCR khi hoàn tất.
+   * Thanh tiến trình dành 90% cho OCR, 4% cho hậu kiểm ảnh và phần còn lại cho hoàn thiện/ghi file; chỉ đạt 100% sau khi lưu thành công.
+   * GUI hiển thị riêng các trạng thái `OCR`, `Quality retry`, `Hậu kiểm ảnh`, `Lưu kết quả` và `Đang tạm dừng`.
+   * OCR chính dùng timeout 300 giây và retry tối đa hai lần. Hậu kiểm tùy chọn dùng timeout 45 giây, không retry và luôn giữ OCR ban đầu khi thất bại.
 7. **Hậu kiểm dựa trên ảnh**:
-   * Bộ kiểm tra chỉ đề cử dòng nghi ngờ: ngày/số hiệu bất thường, mất dấu diện rộng, ký tự dính, dấu câu có thể do nét bút và khối người ký có nguy cơ thiếu.
-   * Dòng nghi ngờ được crop cùng vùng trước/sau rồi gửi Qwen đọc lại. Chỉ áp dụng thay đổi khi ảnh xác nhận rõ và độ tin cậy đạt tối thiểu `0.98`.
+   * Mỗi trang bình thường chỉ có một lượt OCR chính. `ocr_qwen_images` không tự retry bảng; quality gate là nơi duy nhất điều phối OCR lại toàn trang, tránh các retry lồng nhau.
+   * Bộ kiểm tra chỉ đề cử vùng nghi ngờ, không trực tiếp sửa Markdown: ngày/số hiệu bất thường, mất dấu diện rộng, ký tự dính, dòng bị cắt, khác biệt OCR theo vùng, chữ giao với đồ họa, bảng sai lưới và khối người ký có nguy cơ thiếu.
+   * Trang đạt Quality Gate 100 bỏ qua hậu kiểm dòng. Chỉ tối đa hai ứng viên `critical`/`high` được giữ; `medium`/`low` không gọi Qwen và hai vùng gần nhau được gộp thành một crop.
+   * Mỗi vùng lỗi được crop kèm vùng đọc trước/sau. Từ hai vùng trở lên chiếm ít nhất 20% trang, ít nhất ba lỗi nghiêm trọng, hoặc mất dấu trên nhiều dòng thì OCR lại toàn trang; sau đó không đọc lại từng vùng. Lỗi lưới bảng được chuyển cho quality retry chuyên xử lý bảng.
+   * Chỉ áp dụng thay đổi vùng khi ảnh xác nhận rõ và độ tin cậy đạt tối thiểu `0.98`; kết quả OCR lại toàn trang chỉ được chọn nếu quality gate đánh giá an toàn hơn.
+   * Luồng mặc định OCR toàn trang một lần để bảo đảm tốc độ; layout chỉ hỗ trợ reading order và vị trí ảnh. OCR riêng theo vùng chỉ thực hiện khi hậu kiểm phát hiện lỗi nghiêm trọng. Hậu kiểm footer chỉ bật ở trang cuối khi đồ họa phần dưới trang thực sự giao với vùng chữ.
    * Không tự sửa lỗi chính tả vốn được in trên tài liệu. Nếu không chắc chắn, hệ thống giữ kết quả OCR đầu tiên.
 8. **Phân loại chuyên ngành có kiểm soát**:
    * Không dùng danh sách từ khóa để ép tài liệu vào một loại cố định.
-   * Vùng cuối trang cuối được hậu kiểm cho mọi loại tài liệu, gồm công văn, hợp đồng, biên bản, chứng nhận và biểu mẫu.
+   * Quy tắc footer áp dụng cho mọi loại tài liệu nhưng chỉ chạy khi có bằng chứng hình học về đồ họa giao chữ, không dựa vào từ khóa hành chính.
+
+---
+
+## Benchmark cấu hình laptop
+
+Đặt đúng ba file `0001.pdf`, `0002.pdf`, `0003.pdf` trong một thư mục, sau đó kiểm tra testcase:
+
+```powershell
+python tests/benchmark_laptop_matrix.py --input test_input --dry-run
+```
+
+Chạy ma trận DPI `200/250/300` với `workers=1/2`:
+
+```powershell
+python tests/benchmark_laptop_matrix.py --input test_input --runs 1 --model qwen3.5:4b
+```
+
+Kết quả được lưu tại `output/laptop_matrix`: `results.csv`, `results.json`, `summary.json`, Markdown và log riêng của từng lượt. Nếu có ground truth, đặt `test_input/expected/0001.md`–`0003.md` để runner tính thêm CER, WER và F1 cấu trúc. Runner không tự đóng ứng dụng GPU hoặc khởi động lại Ollama.
 
 ---
 
@@ -79,7 +108,7 @@ graph TD
     I -->|Hợp lệ| K[6. Quality Gate]
     J --> K
     K --> L[7. Phân loại toàn tài liệu]
-    L --> N[8. Crop dòng nghi ngờ<br/>Qwen đọc lại từ ảnh]
+    L --> N[8. Gom tối đa 2 vùng critical/high<br/>một yêu cầu Qwen/trang]
     N --> O{Độ tin cậy >= 0.98?}
     O -->|Có| P[Áp dụng sửa lỗi OCR]
     O -->|Không| Q[Giữ OCR ban đầu]
@@ -95,8 +124,8 @@ graph TD
 4. **Nhận diện bằng AI:** Qwen OCR toàn trang và chỉ chép nội dung nhìn thấy. Layout là gợi ý hình học, không được phép làm mất chữ nằm trong vùng bị gắn nhãn ảnh/con dấu.
 5. **Cơ chế tự sửa lỗi (Self-Correction):** Nếu phát hiện Qwen xuất bảng bị vỡ hoặc sai định dạng Markdown, hệ thống tự động bắt AI chạy lại (Retry) với hướng dẫn sửa lỗi cấu trúc bảng HTML.
 6. **Quality gate:** Kiểm tra bảng, Markdown, LaTeX, nội dung lặp, mất dấu diện rộng và placeholder. Lỗi diện rộng làm Qwen OCR lại toàn trang.
-7. **Hậu kiểm không phụ thuộc loại tài liệu:** Vùng cuối trang cuối luôn được đối chiếu với ảnh; không yêu cầu `Số`, `Nơi nhận`, tên cơ quan hay chức danh cố định.
-8. **Hậu kiểm bằng ảnh:** Từ điển và heuristic chỉ tìm ứng viên. Qwen đọc lại crop có ngữ cảnh; kết quả JSON không hợp lệ, thay đổi quá rộng hoặc độ tin cậy dưới `0.98` đều bị từ chối.
+7. **Hậu kiểm không phụ thuộc loại tài liệu:** Khi trang cuối có vùng đồ họa cần đối chiếu, hệ thống kiểm tra vùng cuối mà không yêu cầu `Số`, `Nơi nhận`, tên cơ quan hay chức danh cố định.
+8. **Hậu kiểm bằng ảnh:** Từ điển và heuristic chỉ tìm ứng viên; cảnh báo nhẹ không gọi Qwen. Các crop nghiêm trọng được đọc trong một batch; kết quả JSON không hợp lệ, thay đổi quá rộng hoặc độ tin cậy dưới `0.98` đều bị từ chối.
 9. **Hoàn thiện:** Gộp trang/bảng, chuẩn hóa cấu trúc, ghi file Markdown và chỉ giữ các ảnh nội dung được Markdown tham chiếu.
 
 ### Nguyên tắc chữ ký, con dấu và chính tả

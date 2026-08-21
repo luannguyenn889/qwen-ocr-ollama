@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from app.core import batch_ocr
 from app.gui import run_gui
-from app.gui.run_gui import AppGUI, OCRWorker, format_elapsed
+from app.gui.run_gui import AppGUI, OCRWorker, completed_page_percent, format_elapsed
 
 
 class GuiWorkerControlTests(unittest.TestCase):
@@ -14,6 +14,13 @@ class GuiWorkerControlTests(unittest.TestCase):
         self.assertEqual(format_elapsed(12.4), "12 giây")
         self.assertEqual(format_elapsed(125), "2 phút 5 giây")
         self.assertEqual(format_elapsed(3723), "1 giờ 2 phút 3 giây")
+
+    def test_page_ocr_progress_reserves_final_steps(self):
+        self.assertEqual(completed_page_percent(0, 3), 0)
+        self.assertEqual(completed_page_percent(3, 3), 90)
+
+    def test_ollama_request_timeout_is_five_minutes(self):
+        self.assertEqual(batch_ocr.OLLAMA_REQUEST_TIMEOUT_SECONDS, 300.0)
 
     def test_gui_uses_core_image_extraction_and_cleaning(self):
         self.assertIs(run_gui.extract_images_from_page, batch_ocr.extract_images_from_page)

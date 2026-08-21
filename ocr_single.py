@@ -4,6 +4,7 @@ Nhiệm vụ: Chạy nhận diện OCR cho một tệp hình ảnh đơn lẻ s�
 """
 
 import sys
+import re
 from pathlib import Path
 from time import perf_counter
 from ollama import Client
@@ -46,12 +47,8 @@ def main():
 
     # Làm sạch các rào chắn Markdown nếu có
     clean_text = raw_text
-    if clean_text.startswith("```markdown"):
-        clean_text = clean_text[len("```markdown"):]
-    elif clean_text.startswith("```"):
-        clean_text = clean_text[3:]
-    if clean_text.endswith("```"):
-        clean_text = clean_text[:-3]
+    clean_text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\r?\n?", "", clean_text)
+    clean_text = re.sub(r"\r?\n?```\s*$", "", clean_text)
     clean_text = clean_text.strip()
 
     output_path.write_text(clean_text, encoding="utf-8")

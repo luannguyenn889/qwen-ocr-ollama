@@ -209,6 +209,32 @@ def repair_unclosed_table_html(markdown: str, stats: MarkdownNormalizationStats 
     return f"{markdown.rstrip()}\n" + "".join(missing)
 
 
+def normalize_html_table_blocks(markdown: str) -> str:
+    """Keep raw HTML tables as one Markdown HTML block.
+
+    A blank line terminates a CommonMark HTML block. Vision models sometimes
+    insert such a line at a page boundary and indent the following ``tr``/``td``
+    tags, which makes the rest of the table render as source code. Remove only
+    whitespace-only lines inside complete table blocks and normalize indentation
+    of structural table tags; cell text and whitespace outside tables are kept.
+    """
+    table_re = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+    structural_tag_re = re.compile(
+        r"^\s*(</?(?:table|thead|tbody|tfoot|tr|th|td)\b[^>]*>)",
+        re.IGNORECASE,
+    )
+
+    def normalize(match: re.Match[str]) -> str:
+        lines = []
+        for line in match.group(0).splitlines():
+            if not line.strip():
+                continue
+            lines.append(structural_tag_re.sub(r"\1", line))
+        return "\n".join(lines)
+
+    return table_re.sub(normalize, markdown)
+
+
 def remove_standalone_page_artifacts(
     markdown: str, stats: MarkdownNormalizationStats | None = None
 ) -> str:
@@ -226,12 +252,31 @@ def remove_standalone_page_artifacts(
         nonblank_after = sum(bool(value.strip()) for value in lines[index + 1:boundary])
         return nonblank_after <= 4
 
+    def near_page_start(index: int) -> bool:
+        """True for the first few visible lines after a page marker.
+
+        Rotated scans commonly place the physical footer at the top of the
+        corrected image, so its page number is emitted immediately after the
+        ``<!-- Page N -->`` boundary rather than at the end of the page block.
+        """
+        previous_boundary = max(
+            (value for value in page_boundaries[:-1] if value < index),
+            default=-1,
+        )
+        nonblank_before = sum(
+            bool(value.strip()) for value in lines[previous_boundary + 1:index]
+        )
+        return previous_boundary >= 0 and nonblank_before <= 2
+
     for index, line in enumerate(lines):
         is_footer = bool(
             _PAGE_FOOTER_RE.fullmatch(line)
             or _MAGAZINE_FOOTER_RE.fullmatch(line)
             or (_GENERIC_FOOTER_RE.fullmatch(line) and near_page_end(index))
-            or (_STANDALONE_PAGE_NUMBER_RE.fullmatch(line) and near_page_end(index))
+            or (
+                _STANDALONE_PAGE_NUMBER_RE.fullmatch(line)
+                and (near_page_end(index) or near_page_start(index))
+            )
         )
         # Magazine footers are sometimes OCRed as a standalone page number on
         # one line followed by the publication/hashtag on the next line.
@@ -360,6 +405,5 @@ def normalize_structure(
     markdown = remove_standalone_page_artifacts(markdown, stats)
     markdown = stitch_cross_page_paragraphs(markdown, stats)
     markdown = repair_unclosed_table_html(markdown, stats)
+    markdown = normalize_html_table_blocks(markdown)
     return re.sub(r"\n{3,}", "\n\n", markdown).strip()
-
-

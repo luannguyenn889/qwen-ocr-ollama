@@ -33,13 +33,15 @@ import pymupdf  # PyMuPDF
 # pyrefly: ignore [missing-import]
 from ollama import Client
 from app.core.batch_ocr import (
-    ENABLE_LAYOUT_DETECTION, MODEL, PROMPT as CORE_PROMPT,
+    ENABLE_LAYOUT_DETECTION, MODEL, OLLAMA_REQUEST_TIMEOUT_SECONDS, PROMPT as CORE_PROMPT,
     TABLE_HTML_RETRY_INSTRUCTION, TABLE_RENDER_DPI, TABLE_SAFE_INSTRUCTION,
     TABLE_STRUCTURE_REPAIR_PROMPT, clean_markdown as core_clean_markdown,
     TEXT_ONLY_OUTPUT,
-    QUALITY_RETRY_INSTRUCTION, apply_page_assets, cleanup_unreferenced_assets, quality_retry_instruction,
+    QUALITY_RETRY_INSTRUCTION, apply_page_assets, classify_graphic_crop,
+    cleanup_unreferenced_assets, deduplicate_exact_assets, quality_retry_instruction,
     extract_images_from_page as core_extract_images_from_page,
     finalize_markdown, format_finalization_report, link_extracted_images,
+    merge_markdown_tables as core_merge_markdown_tables,
     needs_table_retry, normalize_worker_count, render_table_page, resolve_qwen_model,
     normalized_document_stem, ocr_coordinate_blocks, ocr_qwen_images,
     output_markdown_path, PipelineCancelled, retain_extracted_image_blocks,
@@ -51,99 +53,12 @@ from tkinter.scrolledtext import ScrolledText
 PROMPT = CORE_PROMPT
 
 def merge_markdown_tables(markdown_text: str) -> str:
-    lines = markdown_text.splitlines()
-    blocks = []
-    
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        
-        is_table_start = stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") > 1
-        if is_table_start and i + 1 < len(lines):
-            next_stripped = lines[i + 1].strip()
-            is_sep = next_stripped.startswith("|") and next_stripped.endswith("|") and all(c in " -:+|" for c in next_stripped)
-            if is_sep:
-                table_rows = []
-                table_comments = []
-                while i < len(lines):
-                    curr_line = lines[i]
-                    curr_stripped = curr_line.strip()
-                    if curr_stripped.startswith("<!--") and curr_stripped.endswith("-->"):
-                        table_comments.append(curr_line)
-                        i += 1
-                        continue
-                    if curr_stripped.startswith("|") and curr_stripped.endswith("|") and curr_stripped.count("|") > 1:
-                        table_rows.append(curr_line)
-                        i += 1
-                    else:
-                        break
-                blocks.append({
-                    "type": "table",
-                    "rows": table_rows,
-                    "comments": table_comments
-                })
-                continue
-                
-        if stripped.startswith("<!--") and stripped.endswith("-->"):
-            blocks.append({"type": "comment", "line": line})
-        else:
-            blocks.append({"type": "text", "line": line})
-        i += 1
-
-    merged_blocks = []
-    for block in blocks:
-        if block["type"] == "table":
-            found_table_idx = None
-            only_whitespace_or_comments = True
-            for idx in range(len(merged_blocks) - 1, -1, -1):
-                prev = merged_blocks[idx]
-                if prev["type"] == "table":
-                    found_table_idx = idx
-                    break
-                elif prev["type"] == "comment":
-                    continue
-                elif prev["type"] == "text" and prev["line"].strip() == "":
-                    continue
-                else:
-                    only_whitespace_or_comments = False
-                    break
-            
-            if found_table_idx is not None and only_whitespace_or_comments:
-                last = merged_blocks[found_table_idx]
-                header_last = [c.strip().lower() for c in last["rows"][0].split("|")[1:-1]]
-                header_curr = [c.strip().lower() for c in block["rows"][0].split("|")[1:-1]]
-                
-                if header_last == header_curr:
-                    data_rows = block["rows"][2:]
-                    last["rows"].extend(data_rows)
-                    last["comments"].extend(block["comments"])
-                    # Remove the skipped whitespace/comment blocks in between
-                    del merged_blocks[found_table_idx + 1:]
-                    continue
-                    
-        merged_blocks.append(block)
-        
-    output = []
-    for block in merged_blocks:
-        if block["type"] == "text":
-            output.append(block["line"])
-        elif block["type"] == "comment":
-            output.append(block["line"])
-        elif block["type"] == "table":
-            output.extend(block["rows"])
-            output.extend(block["comments"])
-            
-    return "\n".join(output)
+    return core_merge_markdown_tables(markdown_text)
 
 def clean_markdown(text: str) -> str:
     text = text.strip()
-    if text.startswith("```markdown"):
-        text = text[len("```markdown"):]
-    elif text.startswith("```"):
-        text = text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
+    text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\r?\n?", "", text)
+    text = re.sub(r"\r?\n?```\s*$", "", text)
     text = text.strip()
 
     # Remove a model acknowledgement before the actual document Markdown.
@@ -241,6 +156,13 @@ def format_elapsed(seconds: float) -> str:
     return f"{secs} giây"
 
 
+def completed_page_percent(completed: int, total: int) -> float:
+    """Reserve the final 10% for image review and atomic output writing."""
+    if total <= 0:
+        return 0.0
+    return min(90.0, max(0.0, completed / total * 90.0))
+
+
 class OCRWorker:
     def __init__(self, target_path: Path, output_dir: Path, progress_queue: queue.Queue, stop_event: threading.Event, resume_event: threading.Event, model_name: str, workers: int = 1):
         self.workers = normalize_worker_count(workers, model_name)
@@ -253,7 +175,9 @@ class OCRWorker:
         self.stop_event = stop_event
         self.resume_event = resume_event
         self.model_name = model_name
-        self.client = Client(host="http://localhost:11434")
+        self.client = Client(
+            host="http://localhost:11434", timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+        )
 
     def _before_qwen_request(self):
         """Wait while paused and abort cleanly when the user cancels."""
@@ -288,7 +212,8 @@ class OCRWorker:
                 if self.stop_event.is_set():
                     break
                 
-                self.progress_queue.put(("file_progress", (file_idx, total_files, pdf_path.name)))
+                self.progress_queue.put(("file_progress", (file_idx - 1, total_files, pdf_path.name)))
+                self.progress_queue.put(("stage_status", "OCR"))
                 self.progress_queue.put(("log", f"\n[File {file_idx}/{total_files}] Đang xử lý: {pdf_path.name}\n"))
                 
                 # Tạo thư mục đầu ra
@@ -302,6 +227,7 @@ class OCRWorker:
                     self.progress_queue.put(("log", "  - Đang render PDF thành hình ảnh (300 DPI)...\n"))
                     doc = pymupdf.open(pdf_path)
                     total_pages = len(doc)
+                    self.progress_queue.put(("page_progress", (0, total_pages)))
                     
                     page_images = []
                     render_timings = []
@@ -325,6 +251,10 @@ class OCRWorker:
                     is_hybrid = "hybrid" in self.model_name.lower()
                     hybrid_model = resolve_qwen_model(self.model_name)
                     layout_detector = None
+                    page_review_regions = {}
+                    page_graphic_regions = {}
+                    page_quality_scores = {}
+                    page_block_spans = {}
                     if ENABLE_LAYOUT_DETECTION:
                         try:
                             from app.core.layout_detector import create_layout_detector
@@ -339,7 +269,7 @@ class OCRWorker:
                             return None
                         
                         page_num = idx + 1
-                        self.progress_queue.put(("page_progress", (page_num, total_pages)))
+                        selected_model = hybrid_model if is_hybrid else resolve_qwen_model(self.model_name)
                         self.progress_queue.put(("log", f"  - Đang OCR Trang {page_num}/{total_pages}...\n"))
                         
                         started_at = time.perf_counter()
@@ -349,6 +279,8 @@ class OCRWorker:
                         qwen_first_seconds = 0.0
                         retry_seconds = 0.0
                         extracted_paths = []
+                        current_block_spans = []
+                        mapped_markdown = None
 
                         qwen_images = [img_path]
                         has_table = False
@@ -392,6 +324,14 @@ class OCRWorker:
                                 page_image_path=img_path,
                                 segments=page_analysis.segments if page_analysis else None,
                                 detected_images=page_analysis.images if page_analysis else [],
+                                table_regions=page_analysis.tables if page_analysis else [],
+                                graphic_classifier=lambda crop: classify_graphic_crop(
+                                    self.client, selected_model, crop,
+                                    before_request=self._before_qwen_request,
+                                    log_func=lambda message: self.progress_queue.put((
+                                        "log", f"    -> [Trang {page_num}] {message}\n"
+                                    )),
+                                ),
                             )
                         except StopIteration:
                             pass
@@ -404,17 +344,20 @@ class OCRWorker:
                             )
 
                         qwen_started_at = time.perf_counter()
+                        assets_applied = False
 
                         try:
-                            selected_model = hybrid_model if is_hybrid else resolve_qwen_model(self.model_name)
                             page_md = ocr_coordinate_blocks(
                                 self.client, selected_model, img_path, ordered_blocks, extracted_paths,
                                 temp_dir_path / "layout_blocks" / f"page_{page_num}",
                                 page_number=page_num,
                                 log_func=lambda message: self.progress_queue.put(("log", f"    -> [Trang {page_num}] {message}\n")),
                                 before_request=self._before_qwen_request,
+                                mapping_sink=current_block_spans,
                             )
                             if page_md is not None:
+                                mapped_markdown = page_md
+                                assets_applied = True
                                 self.progress_queue.put(("log", "    -> Đã OCR toàn trang một lần và đặt ảnh theo reading order.\n"))
                             else:
                                 page_md = ocr_qwen_images(
@@ -429,7 +372,8 @@ class OCRWorker:
                         
                         if extracted_paths:
                             self.progress_queue.put(("log", f"    -> Đã trích xuất {len(extracted_paths)} hình ảnh từ PDF trang {page_num}.\n"))
-                        page_md = apply_page_assets(page_md, page_num, extracted_paths)
+                        if not assets_applied:
+                            page_md = apply_page_assets(page_md, page_num, extracted_paths)
 
                         from app.core.quality_gate import choose_best_page, evaluate_page
                         quality = evaluate_page(page_md, self.output_dir, check_tables=has_table)
@@ -439,6 +383,7 @@ class OCRWorker:
                         if quality.warnings:
                             self.progress_queue.put(("log", f"    -> [Cảnh báo] Trang {page_num}: {', '.join(quality.warnings)}\n"))
                         if quality.should_retry:
+                            self.progress_queue.put(("stage_status", f"Quality retry – trang {page_num}"))
                             initial_md, initial_quality = page_md, quality
                             self.progress_queue.put(("log", f"    -> Quality retry trang {page_num} (Điểm: {quality.score}/100 < ngưỡng hoặc có lỗi nghiêm trọng): {', '.join(quality.errors)}\n"))
                             retry_started_at = time.perf_counter()
@@ -469,6 +414,8 @@ class OCRWorker:
                                 page_md, quality = choose_best_page(
                                     initial_md, initial_quality, retry_md, retry_quality
                                 )
+                                if page_md == retry_md:
+                                    current_block_spans = []
                             retry_seconds = time.perf_counter() - retry_started_at
                             if not quality.passed:
                                 self.progress_queue.put((
@@ -476,7 +423,15 @@ class OCRWorker:
                                     f"    -> [Cảnh báo] Trang {page_num} (Điểm: {quality.score}/100) "
                                     f"({', '.join(quality.errors)}); dùng kết quả tốt nhất và tiếp tục.\n",
                                 ))
+                            self.progress_queue.put(("stage_status", "OCR"))
 
+                        page_md, extracted_paths, duplicate_assets = deduplicate_exact_assets(
+                            page_md, extracted_paths, self.output_dir,
+                        )
+                        if duplicate_assets:
+                            self.progress_queue.put((
+                                "log", f"    -> Đã gộp {duplicate_assets} ảnh trùng hoàn toàn ở trang {page_num}.\n"
+                            ))
                         removed_assets = cleanup_unreferenced_assets(page_md, extracted_paths, self.output_dir)
                         if removed_assets:
                             self.progress_queue.put((
@@ -502,6 +457,20 @@ class OCRWorker:
                             remaining_pages = total_pages - pages_done
                             eta_seconds = avg_time * remaining_pages
                             self.progress_queue.put(("stats_update", (avg_time, eta_seconds)))
+                            self.progress_queue.put(("page_progress", (pages_done, total_pages)))
+                            page_review_regions[page_num] = [
+                                bbox for kind, bbox in ordered_blocks if kind != "image"
+                            ]
+                            page_graphic_regions[page_num] = [
+                                bbox for kind, bbox in ordered_blocks if kind == "image"
+                            ]
+                            page_quality_scores[page_num] = quality.score
+                            if current_block_spans and mapped_markdown is not None and page_md != mapped_markdown:
+                                from app.core.block_assembler import rebase_block_spans
+                                current_block_spans = rebase_block_spans(
+                                    mapped_markdown, page_md, current_block_spans,
+                                )
+                            page_block_spans[page_num] = current_block_spans
                         
                         return (page_num, page_md)
 
@@ -525,6 +494,8 @@ class OCRWorker:
                                 results.append(res)
                     
                     results.sort(key=lambda x: x[0])
+                    self.progress_queue.put(("stage_status", "Hậu kiểm ảnh"))
+                    self.progress_queue.put(("stage_progress", 94))
                     from app.core.image_grounded_review import review_suspicious_lines
                     reviewed_results = []
                     for page_num, page_md in results:
@@ -535,7 +506,13 @@ class OCRWorker:
                                 temp_dir_path / "review_crops" / f"page_{page_num}",
                                 log_func=lambda message, number=page_num: self.progress_queue.put(("log", f"    -> [Trang {number}] {message}\n")),
                                 before_request=self._before_qwen_request,
-                                review_document_footer=page_num == total_pages,
+                                regions=page_review_regions.get(page_num),
+                                graphic_regions=page_graphic_regions.get(page_num),
+                                block_spans=page_block_spans.get(page_num) or None,
+                                review_document_footer=(
+                                    page_num == total_pages and bool(page_graphic_regions.get(page_num))
+                                ),
+                                quality_score=page_quality_scores.get(page_num),
                             )
                         except PipelineCancelled:
                             return None
@@ -555,6 +532,8 @@ class OCRWorker:
                         break
                         
                     # Save results
+                    self.progress_queue.put(("stage_status", "Lưu kết quả"))
+                    self.progress_queue.put(("stage_progress", 98))
                     final_md = "\n\n".join(ocr_contents) + "\n"
                     finalization_report = {"spelling_warnings": []}
                     try:
@@ -568,6 +547,8 @@ class OCRWorker:
                     write_started_at = time.perf_counter()
                     temp_output_path.write_text(final_md, encoding="utf-8")
                     os.replace(temp_output_path, output_path)
+                    self.progress_queue.put(("stage_progress", 100))
+                    self.progress_queue.put(("file_progress", (file_idx, total_files, pdf_path.name)))
                     write_seconds = time.perf_counter() - write_started_at
                     self.progress_queue.put(("log", f"  - Đã lưu kết quả tại: {output_path.name}\n"))
                     self.progress_queue.put(("log", f"  - Benchmark ghi file: {write_seconds:.3f}s\n"))
@@ -666,7 +647,7 @@ class AppGUI:
 
         models_list = []
         try:
-            response = Client(host="http://localhost:11434").list()
+            response = Client(host="http://localhost:11434", timeout=10.0).list()
             available_models = getattr(response, "models", None)
             if available_models is None and isinstance(response, dict):
                 available_models = response.get("models", [])
@@ -1016,10 +997,12 @@ class AppGUI:
         if self.is_paused:
             self.resume_event.clear()
             self.btn_pause.configure(text="Tiếp tục")
+            self.progress_queue.put(("stage_status", "Đang tạm dừng"))
             self.progress_queue.put(("log", "\n[TẠM DỪNG] Tiến trình đang tạm dừng...\n"))
         else:
             self.resume_event.set()
             self.btn_pause.configure(text="Tạm dừng")
+            self.progress_queue.put(("stage_status", "Đang tiếp tục xử lý"))
             self.progress_queue.put(("log", "\n[TIẾP TỤC] Tiến trình tiếp tục chạy...\n"))
 
     def stop_ocr(self):
@@ -1065,9 +1048,14 @@ class AppGUI:
                     self.file_progressbar["value"] = percent
                 elif msg_type == "page_progress":
                     curr, total = data
-                    self.page_progress_var.set(f"Trang {curr}/{total}")
-                    percent = (curr / total) * 100
-                    self.page_progressbar["value"] = percent
+                    self.page_progress_var.set(f"OCR hoàn tất: {curr}/{total} trang")
+                    self.page_progressbar["value"] = completed_page_percent(curr, total)
+                elif msg_type == "stage_status":
+                    self.page_progress_var.set(f"Giai đoạn: {data}")
+                    if data == "Đang tạm dừng":
+                        self.stats_active_var.set("Trạng thái: Đang tạm dừng")
+                elif msg_type == "stage_progress":
+                    self.page_progressbar["value"] = min(100, max(0, float(data)))
                 elif msg_type == "page_timer_start":
                     page_num, started_at = data
                     if not hasattr(self, "active_page_timers"):
@@ -1105,7 +1093,9 @@ class AppGUI:
             except Exception:
                 pass
         active_timers = getattr(self, "active_page_timers", {})
-        if active_timers and self._is_running:
+        if getattr(self, "is_paused", False) and self._is_running:
+            self.stats_active_var.set("Trạng thái: Đang tạm dừng")
+        elif active_timers and self._is_running:
             now = time.perf_counter()
             running = " | ".join(
                 f"Trang {page_num}: {now - started_at:.1f}s"
