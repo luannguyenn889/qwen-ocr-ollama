@@ -1177,6 +1177,29 @@ def remove_orphan_image_placeholders(markdown: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", markdown).strip()
 
 
+def normalize_escaped_image_links(markdown: str) -> str:
+    """Repair image links whose opening parenthesis/path was escaped by Qwen."""
+    def repair(match: re.Match[str]) -> str:
+        alt_text = match.group(1)
+        image_path = match.group(2).replace(r"\_", "_")
+        return f"![{alt_text}]({image_path})"
+
+    # Restrict cleanup to image syntax so LaTeX, code and literal backslashes
+    # elsewhere in the OCR remain unchanged.
+    markdown = re.sub(
+        r"!\[([^\]\n]*)\]\\\(([^)\n]*?)(?:\\)?\)",
+        repair,
+        markdown,
+    )
+    # Four leading spaces turn a standalone image into a Markdown code block.
+    # Keep indentation elsewhere intact and only lift complete image-only lines.
+    return re.sub(
+        r"(?m)^[ \t]{4,}(!\[[^\]\n]*\]\([^)\n]+\))[ \t]*$",
+        r"\1",
+        markdown,
+    )
+
+
 def _insert_images_by_reading_order(
     markdown: str, image_paths: list[str], typed_blocks=None,
 ) -> str:
@@ -1549,6 +1572,7 @@ def finalize_markdown(
     from app.core.markdown_normalizer import MarkdownNormalizationStats, normalize_structure
 
     stats = MarkdownNormalizationStats()
+    markdown = normalize_escaped_image_links(markdown)
     markdown = remove_orphan_image_placeholders(markdown)
     markdown = normalize_structure(markdown, stats)
     table_count_before = len(re.findall(r"<table\b", markdown, re.IGNORECASE))

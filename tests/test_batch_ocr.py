@@ -10,12 +10,22 @@ from unittest.mock import Mock, patch
 from app.core.batch_ocr import (
     MODEL, PROMPT, TEXT_ONLY_OUTPUT, QUALITY_RETRY_INSTRUCTION, TABLE_STRUCTURE_REPAIR_PROMPT,
     clean_markdown, detect_and_rotate_page, finalize_markdown, generate_with_retry, link_extracted_images, merge_markdown_tables, needs_table_retry,
-    needs_vision_retry, normalize_worker_count, output_markdown_path, page_is_tiled_scan, process_single_pdf,
+    needs_vision_retry, normalize_escaped_image_links, normalize_worker_count, output_markdown_path, page_is_tiled_scan, process_single_pdf,
     quality_retry_instruction, repair_markdown_tables,
 )
 
 
 class BatchOcrTests(unittest.TestCase):
+    def test_repairs_escaped_image_parenthesis_and_underscores_only(self):
+        markdown = (
+            r"    ![Ảnh minh họa]\(images/tai\_lieu\_page\_1.png)" "\n"
+            r"Công thức giữ nguyên: $x\_1$"
+        )
+        repaired = normalize_escaped_image_links(markdown)
+        self.assertIn("![Ảnh minh họa](images/tai_lieu_page_1.png)", repaired)
+        self.assertNotIn("    ![", repaired)
+        self.assertIn(r"$x\_1$", repaired)
+
     def test_detect_and_rotate_page_applies_classifier_angle(self):
         from PIL import Image
 
