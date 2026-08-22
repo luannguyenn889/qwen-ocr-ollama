@@ -9,9 +9,9 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
 1. **Đầu ra Markdown sạch có ảnh nội dung**:
    * Mỗi tài liệu tạo một file `<tên-tài-liệu>.md`; ảnh nội dung thực sự được lưu trong thư mục `images/` và liên kết từ Markdown.
    * Crop hậu kiểm, overlay layout và nhật ký hiệu chỉnh chỉ tồn tại tạm thời rồi được xoá.
-   * Không chèn ảnh chữ ký/con dấu; chữ in đọc được xung quanh vẫn được giữ.
+   * Bỏ toàn bộ khối ký xác nhận, gồm ảnh chữ ký/con dấu, chức danh, họ tên và chữ in thuộc khối ký.
    * Ảnh nội dung được đặt theo reading order của layout ngay cả khi Qwen quên tạo `image_placeholder`.
-   * Vùng đồ họa cuối trang không rõ loại được Qwen phân loại riêng mà không OCR nội dung; chỉ chữ ký/con dấu có độ tin cậy tối thiểu `0.98` mới bị loại.
+   * Vùng đồ họa cuối trang không rõ loại được Qwen phân loại riêng mà không OCR nội dung; chữ ký/con dấu chỉ bị loại khi được xác định chắc chắn.
    * Ảnh phân loại được thu tạm xuống tối đa 1024 px với `num_ctx=4096`; nếu vẫn vượt context, hệ thống thử lại một lần ở 768 px rồi giữ ảnh nếu chưa phân loại được.
    * Chỉ gộp ảnh trùng khi dữ liệu tệp giống hoàn toàn; ảnh gần giống hoặc chưa chắc chắn vẫn được giữ.
 2. **Gộp bảng thông minh qua ranh giới trang (Smart Table Merger)**:
@@ -21,6 +21,19 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
    * CLI và GUI render trang OCR ở **300 DPI**; trang có bảng luôn dùng ảnh toàn trang để giữ cấu trúc hàng/cột.
    * LaTeX-OCR là thành phần tùy chọn; khi không khả dụng, Qwen tiếp tục nhận dạng công thức.
 4. **Giao diện GUI chuyên nghiệp (Tkinter)**:
+   * Có ô **Tự động bỏ qua trang trắng**, mặc định bật. Trang trắng được kiểm tra
+     ngay sau khi render và không gửi sang DocLayout hoặc Qwen OCR.
+   * Bộ phát hiện tự bóc viền scan sâu, lỗ bấm/dấu ghim ở mép, chuẩn hóa nền
+     giấy xám/vàng bằng độ tương phản cục bộ và có thể loại đường kẻ lặp của
+     giấy dòng/ô ly. Trang chưa đủ bằng chứng vẫn được giữ để OCR.
+   * Có ba mức **Độ nhạy**: **An toàn** (mặc định, ưu tiên không mất chữ),
+     **Chuẩn** (giấy màu, chữ hằn nhẹ và giấy có nhiều dòng kẻ), **Mạnh mẽ**
+     (scan rất cũ/kraft; cần kiểm tra kết quả kỹ hơn).
+   * Trang chỉ chứa vùng được xác định chắc chắn là chữ ký/con dấu được ghi log
+     riêng và không đưa vào Markdown; quyết định dựa trên phân loại ảnh và phần
+     còn lại sau khi che vùng, không dựa vào chức danh hoặc vị trí cố định. Các
+     mảnh rời của một con dấu được gom thành một vùng và một trang có thể xử lý
+     nhiều con dấu độc lập.
    * **Bất đồng bộ hoàn toàn (Multi-threading)**: Chạy tiến trình OCR trên luồng riêng biệt, không gây treo ứng dụng.
    * **Tiến trình 2 cấp độ (Dual Progress Bars)**: 2 thanh tiến trình trực quan hiển thị song song (Thanh 1: Tiến trình tổng số file; Thanh 2: Tiến trình số trang của file hiện tại).
    * **Trình duyệt nhật ký Console**: Nhật ký nền tối hiển thị thời gian thực chính xác tiến trình xử lý từng trang và cảnh báo chất lượng.
@@ -41,11 +54,10 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
    * Trang đạt Quality Gate 100 bỏ qua hậu kiểm dòng. Chỉ tối đa hai ứng viên `critical`/`high` được giữ; `medium`/`low` không gọi Qwen và hai vùng gần nhau được gộp thành một crop.
    * Mỗi vùng lỗi được crop kèm vùng đọc trước/sau. Từ hai vùng trở lên chiếm ít nhất 20% trang, ít nhất ba lỗi nghiêm trọng, hoặc mất dấu trên nhiều dòng thì OCR lại toàn trang; sau đó không đọc lại từng vùng. Lỗi lưới bảng được chuyển cho quality retry chuyên xử lý bảng.
    * Chỉ áp dụng thay đổi vùng khi ảnh xác nhận rõ và độ tin cậy đạt tối thiểu `0.98`; kết quả OCR lại toàn trang chỉ được chọn nếu quality gate đánh giá an toàn hơn.
-   * Luồng mặc định OCR toàn trang một lần để bảo đảm tốc độ; layout chỉ hỗ trợ reading order và vị trí ảnh. OCR riêng theo vùng chỉ thực hiện khi hậu kiểm phát hiện lỗi nghiêm trọng. Hậu kiểm footer chỉ bật ở trang cuối khi đồ họa phần dưới trang thực sự giao với vùng chữ.
+   * Luồng mặc định OCR toàn trang một lần để bảo đảm tốc độ; layout chỉ hỗ trợ reading order và vị trí ảnh. OCR riêng theo vùng chỉ thực hiện khi hậu kiểm phát hiện lỗi nghiêm trọng; không hậu kiểm để bổ sung khối ký cuối tài liệu.
    * Không tự sửa lỗi chính tả vốn được in trên tài liệu. Nếu không chắc chắn, hệ thống giữ kết quả OCR đầu tiên.
 8. **Phân loại chuyên ngành có kiểm soát**:
    * Không dùng danh sách từ khóa để ép tài liệu vào một loại cố định.
-   * Quy tắc footer áp dụng cho mọi loại tài liệu nhưng chỉ chạy khi có bằng chứng hình học về đồ họa giao chữ, không dựa vào từ khóa hành chính.
 
 ---
 
@@ -121,7 +133,7 @@ graph TD
    - *Nếu có bảng:* Tự động render lại trang với độ phân giải siêu nét (300 DPI) để chống vỡ chữ.
    - *Nếu chia cột:* Tự động cắt riêng từng cột và đọc tuần tự từ trái qua phải.
 3. **Nhận diện công thức:** Vùng công thức có thể được đọc riêng bằng `LaTeX-OCR`; crop chỉ nằm trong thư mục tạm.
-4. **Nhận diện bằng AI:** Qwen OCR toàn trang và chỉ chép nội dung nhìn thấy. Layout là gợi ý hình học, không được phép làm mất chữ nằm trong vùng bị gắn nhãn ảnh/con dấu.
+4. **Nhận diện bằng AI:** Qwen OCR toàn trang và chỉ chép nội dung nhìn thấy. Layout là gợi ý hình học; riêng toàn bộ khối ký xác nhận được bỏ khỏi Markdown.
 5. **Cơ chế tự sửa lỗi (Self-Correction):** Nếu phát hiện Qwen xuất bảng bị vỡ hoặc sai định dạng Markdown, hệ thống tự động bắt AI chạy lại (Retry) với hướng dẫn sửa lỗi cấu trúc bảng HTML.
 6. **Quality gate:** Kiểm tra bảng, Markdown, LaTeX, nội dung lặp, mất dấu diện rộng và placeholder. Lỗi diện rộng làm Qwen OCR lại toàn trang.
 7. **Hậu kiểm không phụ thuộc loại tài liệu:** Khi trang cuối có vùng đồ họa cần đối chiếu, hệ thống kiểm tra vùng cuối mà không yêu cầu `Số`, `Nơi nhận`, tên cơ quan hay chức danh cố định.
@@ -132,7 +144,7 @@ graph TD
 
 * OCR và giữ chữ in như chức danh, tên cơ quan, họ tên và `Nơi nhận`.
 * Không biến nét ký tay hoặc hình con dấu thành văn bản suy đoán.
-* Chữ trong dấu chỉ giữ khi đọc được rõ ràng; không chèn ảnh chữ ký/con dấu.
+* Không OCR hoặc chèn ảnh của toàn bộ khối ký xác nhận, gồm chức danh, họ tên, chữ ký và con dấu.
 * Bộ kiểm tra chính tả không trực tiếp sửa Markdown. Mọi sửa đổi phải được Qwen xác minh lại từ ảnh.
 * Lỗi chính tả có sẵn trên bản gốc được giữ nguyên; Markdown không thay thế giá trị pháp lý của PDF nguồn.
 
@@ -249,6 +261,18 @@ Có thể chỉ định đầu vào, đầu ra, model và số luồng:
 ```powershell
 python batch_ocr.py --input PDF --output OCR --model qwen3.5:4b --workers 1
 ```
+
+Mặc định hệ thống dùng mức phát hiện trang trắng `safe`. Với tài liệu scan cũ,
+giấy màu hoặc giấy kẻ, có thể chọn mức khác:
+
+```powershell
+python batch_ocr.py --input PDF --output OCR --blank-sensitivity standard
+python batch_ocr.py --input PDF --output OCR --blank-sensitivity aggressive
+```
+
+Ba giá trị hợp lệ là `safe`, `standard` và `aggressive`. Dùng
+`--keep-blank-pages` nếu muốn tắt hoàn toàn việc bỏ qua trang trắng và gửi mọi
+trang sang OCR.
 
 Pipeline batch hiện nhận file PDF hoặc thư mục chứa PDF. Nội dung bên trong có thể thuộc nhiều loại tài liệu; quy tắc chuyên ngành không thay thế lõi OCR tổng quát.
 

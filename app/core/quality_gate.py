@@ -319,14 +319,21 @@ def _detect_hallucination_and_repetition(markdown: str) -> list[str]:
     if repetition_stats.repetition_lines_removed:
         errors.append("repetition_loop")
 
-    # 1. Phát hiện lặp dòng liên tiếp (>= 3 dòng giống hệt nhau)
-    dup_lines = 0
+    # 1. Detect four consecutive copies of the same reader-visible line.
+    # Ignore Markdown heading depth so hallucinated ladders such as
+    # ``# date``, ``## date``, ... cannot bypass the repetition gate.
+    duplicate_run = 0
+    longest_duplicate_run = 0
     last_line = ""
     for line in lines:
-        if len(line) >= 10 and line == last_line:
-            dup_lines += 1
-        last_line = line
-    if dup_lines >= 3:
+        visible_line = re.sub(r"^#{1,6}\s+", "", line).strip().casefold()
+        if len(visible_line) >= 6 and visible_line == last_line:
+            duplicate_run += 1
+        else:
+            duplicate_run = 0
+        longest_duplicate_run = max(longest_duplicate_run, duplicate_run)
+        last_line = visible_line
+    if longest_duplicate_run >= 3:
         errors.append("repetition_loop")
 
     # 2. Phát hiện lặp từ liên tiếp trong 1 dòng (> 4 từ giống nhau)

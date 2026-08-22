@@ -167,6 +167,13 @@ class QualityGateTests(unittest.TestCase):
         )
         report = evaluate_page(block * 4, ".")
         self.assertIn("repetition_loop", report.errors)
+
+    def test_detects_repeated_payload_across_heading_levels(self):
+        markdown = "\n\n".join(
+            f"{'#' * level} 10/24/2023" for level in range(1, 6)
+        )
+        report = evaluate_page(markdown, Path("."))
+        self.assertIn("repetition_loop", report.errors)
         self.assertTrue(report.should_retry)
 
     def test_detects_unclosed_markdown_code_blocks(self):

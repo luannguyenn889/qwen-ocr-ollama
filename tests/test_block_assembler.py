@@ -34,9 +34,10 @@ class BlockAssemblerTests(unittest.TestCase):
         self.assertEqual(result, [text, kept_figure])
 
     def test_core_prompt_prioritizes_text_over_graphic_layout_labels(self):
-        self.assertIn("Never let an `image`, `figure`, `seal`", PROMPT)
-        self.assertIn("regardless of the\n     document type", PROMPT)
-        self.assertIn("signature or stamp by default", PROMPT)
+        self.assertIn("Never let an\n     `image`, `figure`, drawing", PROMPT)
+        self.assertIn("signature/stamp confirmation block is excluded as a whole", PROMPT)
+        self.assertIn("Do not emit an image tag or transcribe text", PROMPT)
+        self.assertIn("signing title, signer name", PROMPT)
 
     def test_surplus_formula_placeholder_is_removed(self):
         result = apply_page_assets("Trước formula_placeholder sau", 1, [], [])

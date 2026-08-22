@@ -44,7 +44,10 @@ from app.core.batch_ocr import (
     merge_markdown_tables as core_merge_markdown_tables,
     needs_table_retry, normalize_worker_count, render_table_page, resolve_qwen_model,
     normalized_document_stem, ocr_coordinate_blocks, ocr_qwen_images,
-    output_markdown_path, PipelineCancelled, retain_extracted_image_blocks,
+    output_markdown_path, BlankOCRResult, PipelineCancelled, retain_extracted_image_blocks,
+    classify_page_image, is_blank_pdf_page, is_blank_page_after_masking,
+    is_blank_ocr_response, is_confirmed_signature_stamp,
+    normalize_blank_detection_sensitivity,
 )
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -57,6 +60,8 @@ def merge_markdown_tables(markdown_text: str) -> str:
 
 def clean_markdown(text: str) -> str:
     text = text.strip()
+    if is_blank_ocr_response(text):
+        return ""
     text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\r?\n?", "", text)
     text = re.sub(r"\r?\n?```\s*$", "", text)
     text = text.strip()
@@ -164,7 +169,12 @@ def completed_page_percent(completed: int, total: int) -> float:
 
 
 class OCRWorker:
-    def __init__(self, target_path: Path, output_dir: Path, progress_queue: queue.Queue, stop_event: threading.Event, resume_event: threading.Event, model_name: str, workers: int = 1):
+    def __init__(
+        self, target_path: Path, output_dir: Path, progress_queue: queue.Queue,
+        stop_event: threading.Event, resume_event: threading.Event,
+        model_name: str, workers: int = 1, skip_blank_pages: bool = True,
+        blank_detection_sensitivity: str = "safe",
+    ):
         self.workers = normalize_worker_count(workers, model_name)
         self.layout_lock = threading.Lock()
         self.progress_lock = threading.Lock()
@@ -175,6 +185,10 @@ class OCRWorker:
         self.stop_event = stop_event
         self.resume_event = resume_event
         self.model_name = model_name
+        self.skip_blank_pages = bool(skip_blank_pages)
+        self.blank_detection_sensitivity = normalize_blank_detection_sensitivity(
+            blank_detection_sensitivity
+        )
         self.client = Client(
             host="http://localhost:11434", timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
         )
@@ -202,6 +216,12 @@ class OCRWorker:
 
             total_files = len(pdf_files)
             self.progress_queue.put(("log", f"Bắt đầu xử lý {total_files} file PDF...\n"))
+            if self.skip_blank_pages:
+                self.progress_queue.put((
+                    "log",
+                    "Độ nhạy phát hiện trang trắng: "
+                    f"{self.blank_detection_sensitivity}.\n",
+                ))
             from app.core.formula_ocr import formula_ocr_status
             _, formula_status = formula_ocr_status()
             self.progress_queue.put(("log", f"Trạng thái Formula OCR: {formula_status}.\n"))
@@ -231,16 +251,51 @@ class OCRWorker:
                     
                     page_images = []
                     render_timings = []
+                    blank_pages = set()
+                    uncertain_pages = set()
+                    signature_only_pages = set()
                     for idx in range(total_pages):
                         if self.stop_event.is_set():
                             break
                         render_started_at = time.perf_counter()
                         page = doc.load_page(idx)
+                        if self.skip_blank_pages and is_blank_pdf_page(page):
+                            page_images.append(None)
+                            render_timings.append(0.0)
+                            blank_pages.add(idx + 1)
+                            self.progress_queue.put((
+                                "log",
+                                f"    -> Bỏ qua trang {idx + 1} "
+                                "(trang trắng; cấu trúc PDF rỗng)\n",
+                            ))
+                            continue
                         pix = page.get_pixmap(dpi=300, colorspace=pymupdf.csRGB, alpha=False)
                         img_path = temp_dir_path / f"page_{idx + 1}.png"
                         pix.save(str(img_path))
                         page_images.append(img_path)
                         render_timings.append(time.perf_counter() - render_started_at)
+                        if self.skip_blank_pages:
+                            state, metrics = classify_page_image(
+                                img_path, self.blank_detection_sensitivity,
+                            )
+                            if state == "blank":
+                                blank_pages.add(idx + 1)
+                                self.progress_queue.put((
+                                    "log", f"    -> Bỏ qua trang {idx + 1} (trang trắng)\n"
+                                ))
+                            elif state == "uncertain":
+                                uncertain_pages.add(idx + 1)
+                                self.progress_queue.put((
+                                    "log",
+                                    f"    -> Trang {idx + 1} không chắc chắn có trắng hay không; "
+                                    f"giữ để OCR (light={float(metrics.get('light_ratio', 0.0)):.2%}, "
+                                    f"background={float(metrics.get('background_level', 0.0)):.1f}, "
+                                    f"adaptive_ink={float(metrics.get('adaptive_ink_ratio', 0.0)):.3%}, "
+                                    f"std={float(metrics.get('stddev', 0.0)):.2f}, "
+                                    f"components={int(metrics.get('components', -1))}, "
+                                    f"rules={int(metrics.get('horizontal_rules', 0))}/"
+                                    f"{int(metrics.get('vertical_rules', 0))})\n",
+                                ))
                     doc.close()
                     
                     if self.stop_event.is_set():
@@ -313,6 +368,7 @@ class OCRWorker:
                                 ordered_blocks = []
 
                         try:
+                            discarded_graphics = []
                             if TEXT_ONLY_OUTPUT:
                                 if page_analysis is not None:
                                     page_analysis.images.clear()
@@ -332,11 +388,34 @@ class OCRWorker:
                                         "log", f"    -> [Trang {page_num}] {message}\n"
                                     )),
                                 ),
+                                discarded_graphics_sink=discarded_graphics,
                             )
                         except StopIteration:
                             pass
                         except Exception as img_err:
                             self.progress_queue.put(("log", f"    -> [Chú ý] Không thể trích xuất ảnh: {img_err}\n"))
+
+                        removable_regions = [
+                            bbox for category, confidence, bbox in discarded_graphics
+                            if is_confirmed_signature_stamp(category, confidence)
+                        ]
+                        if removable_regions and is_blank_page_after_masking(
+                            img_path, removable_regions,
+                            self.blank_detection_sensitivity,
+                        ):
+                            cleanup_unreferenced_assets("", extracted_paths, self.output_dir)
+                            self.progress_queue.put((
+                                "log",
+                                f"    -> Bỏ qua trang {page_num} (chỉ chứa chữ ký/con dấu)\n",
+                            ))
+                            with self.progress_lock:
+                                signature_only_pages.add(page_num)
+                                uncertain_pages.discard(page_num)
+                                self.pages_processed += 1
+                                self.progress_queue.put((
+                                    "page_progress", (self.pages_processed, total_pages)
+                                ))
+                            return (page_num, "")
 
                         if page_analysis is not None:
                             ordered_blocks = retain_extracted_image_blocks(
@@ -369,6 +448,22 @@ class OCRWorker:
                             return None
                         qwen_seconds = time.perf_counter() - qwen_started_at
                         qwen_first_seconds = qwen_seconds
+
+                        if isinstance(page_md, BlankOCRResult):
+                            cleanup_unreferenced_assets("", extracted_paths, self.output_dir)
+                            self.progress_queue.put((
+                                "log",
+                                f"    -> Bỏ qua trang {page_num} "
+                                "(Qwen xác nhận không có nội dung)\n",
+                            ))
+                            with self.progress_lock:
+                                blank_pages.add(page_num)
+                                uncertain_pages.discard(page_num)
+                                self.pages_processed += 1
+                                self.progress_queue.put((
+                                    "page_progress", (self.pages_processed, total_pages)
+                                ))
+                            return (page_num, "")
                         
                         if extracted_paths:
                             self.progress_queue.put(("log", f"    -> Đã trích xuất {len(extracted_paths)} hình ảnh từ PDF trang {page_num}.\n"))
@@ -477,7 +572,17 @@ class OCRWorker:
                     import concurrent.futures
                     with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
                         futures = []
+                        results = [(page_num, "") for page_num in sorted(blank_pages)]
+                        if blank_pages:
+                            self.pages_processed += len(blank_pages)
+                            self.progress_queue.put((
+                                "page_progress", (self.pages_processed, total_pages)
+                            ))
                         for idx, img_path in enumerate(page_images):
+                            if idx + 1 in blank_pages:
+                                continue
+                            if img_path is None:
+                                continue
                             future = executor.submit(process_page_worker, (idx, img_path))
                             # Always stop the live timer, including cancellation and
                             # exceptions raised by a failed quality gate.
@@ -487,7 +592,6 @@ class OCRWorker:
                             )
                             futures.append(future)
                         
-                        results = []
                         for future in concurrent.futures.as_completed(futures):
                             res = future.result()
                             if res is not None:
@@ -499,6 +603,9 @@ class OCRWorker:
                     from app.core.image_grounded_review import review_suspicious_lines
                     reviewed_results = []
                     for page_num, page_md in results:
+                        if not page_md or not page_md.strip():
+                            reviewed_results.append((page_num, ""))
+                            continue
                         try:
                             page_md = review_suspicious_lines(
                                 self.client, resolve_qwen_model(self.model_name),
@@ -509,9 +616,7 @@ class OCRWorker:
                                 regions=page_review_regions.get(page_num),
                                 graphic_regions=page_graphic_regions.get(page_num),
                                 block_spans=page_block_spans.get(page_num) or None,
-                                review_document_footer=(
-                                    page_num == total_pages and bool(page_graphic_regions.get(page_num))
-                                ),
+                                review_document_footer=False,
                                 quality_score=page_quality_scores.get(page_num),
                             )
                         except PipelineCancelled:
@@ -526,7 +631,8 @@ class OCRWorker:
                         raise RuntimeError("Thiếu trang trước khi lưu: " + ", ".join(page_quality.errors))
                     
                     for page_num, page_md in results:
-                        ocr_contents.append(f"<!-- Page {page_num} -->\n\n{page_md}")
+                        if page_md and page_md.strip():
+                            ocr_contents.append(f"<!-- Page {page_num} -->\n\n{page_md}")
                     
                     if self.stop_event.is_set():
                         break
@@ -552,6 +658,15 @@ class OCRWorker:
                     write_seconds = time.perf_counter() - write_started_at
                     self.progress_queue.put(("log", f"  - Đã lưu kết quả tại: {output_path.name}\n"))
                     self.progress_queue.put(("log", f"  - Benchmark ghi file: {write_seconds:.3f}s\n"))
+                    self.progress_queue.put((
+                        "log", f"  - Trang trắng đã bỏ: {len(blank_pages)}\n"
+                    ))
+                    self.progress_queue.put((
+                        "log", f"  - Trang chỉ có chữ ký/con dấu đã bỏ: {len(signature_only_pages)}\n"
+                    ))
+                    self.progress_queue.put((
+                        "log", f"  - Trang không chắc chắn được giữ để OCR: {len(uncertain_pages)}\n"
+                    ))
                     file_elapsed = time.perf_counter() - pdf_start_time
                     self.progress_queue.put(("log", f"  - Tổng thời gian OCR file: {format_elapsed(file_elapsed)}\n"))
             
@@ -686,6 +801,23 @@ class AppGUI:
         self.workers_var = tk.IntVar(value=1)
         workers_spin = ttk.Spinbox(model_frame, from_=1, to=2, textvariable=self.workers_var, width=5, font=("Segoe UI", 10))
         workers_spin.pack(side=tk.LEFT)
+
+        self.skip_blank_pages_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            model_frame, text="Tự động bỏ qua trang trắng",
+            variable=self.skip_blank_pages_var,
+        ).pack(side=tk.LEFT, padx=(14, 0))
+
+        ttk.Label(model_frame, text="Độ nhạy:").pack(side=tk.LEFT, padx=(10, 3))
+        self.blank_sensitivity_var = tk.StringVar(value="An toàn")
+        ttk.Combobox(
+            model_frame,
+            textvariable=self.blank_sensitivity_var,
+            values=("An toàn", "Chuẩn", "Mạnh mẽ"),
+            state="readonly",
+            width=10,
+            font=("Segoe UI", 10),
+        ).pack(side=tk.LEFT)
 
 
         # 4. Status & Progress Indicators
@@ -986,6 +1118,14 @@ class AppGUI:
             target_path, Path(output), self.progress_queue, self.stop_event,
             self.resume_event, model_name,
             workers=self.workers_var.get() if hasattr(self, 'workers_var') else 1,
+            skip_blank_pages=(
+                self.skip_blank_pages_var.get()
+                if hasattr(self, "skip_blank_pages_var") else True
+            ),
+            blank_detection_sensitivity=(
+                self.blank_sensitivity_var.get()
+                if hasattr(self, "blank_sensitivity_var") else "safe"
+            ),
         )
         self.worker_thread = threading.Thread(target=worker.run, daemon=True)
         self.worker_thread.start()

@@ -10,12 +10,142 @@ from unittest.mock import Mock, patch
 from app.core.batch_ocr import (
     MODEL, PROMPT, TEXT_ONLY_OUTPUT, QUALITY_RETRY_INSTRUCTION, TABLE_STRUCTURE_REPAIR_PROMPT,
     clean_markdown, detect_and_rotate_page, finalize_markdown, generate_with_retry, link_extracted_images, merge_markdown_tables, needs_table_retry,
-    needs_vision_retry, normalize_escaped_image_links, normalize_worker_count, output_markdown_path, page_is_tiled_scan, process_single_pdf,
+    is_blank_page, is_blank_page_after_masking, needs_vision_retry, normalize_escaped_image_links, normalize_worker_count, output_markdown_path, page_is_tiled_scan, process_single_pdf,
     quality_retry_instruction, repair_markdown_tables,
 )
 
 
 class BatchOcrTests(unittest.TestCase):
+    def test_blank_page_detection_handles_white_and_off_white_scans(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            white = root / "white.png"
+            off_white = root / "off_white.png"
+            Image.new("RGB", (1200, 1600), "white").save(white)
+            noisy = Image.new("RGB", (1200, 1600), (242, 242, 240))
+            draw = ImageDraw.Draw(noisy)
+            draw.line((0, 30, 1199, 34), fill=(215, 215, 210), width=3)
+            draw.line((20, 1500, 1180, 1490), fill=(220, 218, 215), width=3)
+            for x, y in ((80, 90), (1100, 160), (1040, 1490), (60, 1380)):
+                draw.ellipse((x, y, x + 4, y + 4), fill=(120, 110, 100))
+            noisy.save(off_white)
+            self.assertTrue(is_blank_page(white))
+            self.assertTrue(is_blank_page(off_white))
+
+    def test_blank_page_detection_protects_sparse_real_content(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "sparse.png"
+            image = Image.new("L", (1200, 1600), 255)
+            ImageDraw.Draw(image).rectangle((400, 780, 800, 795), fill=0)
+            image.save(image_path)
+            self.assertFalse(is_blank_page(image_path))
+
+    def test_invalid_image_is_never_silently_classified_as_blank(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "invalid.png"
+            image_path.write_bytes(b"not-an-image")
+            self.assertFalse(is_blank_page(image_path))
+
+    def test_page_with_only_masked_signature_or_stamp_becomes_blank(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "stamp_only.png"
+            image = Image.new("RGB", (1000, 1400), "white")
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((350, 850, 650, 1150), outline=(180, 30, 50), width=18)
+            draw.line((400, 1020, 600, 900), fill=(30, 30, 30), width=12)
+            image.save(image_path)
+            region = [(0.32, 0.58, 0.68, 0.85)]
+            self.assertFalse(is_blank_page(image_path))
+            self.assertTrue(is_blank_page_after_masking(image_path, region))
+
+    def test_masking_stamp_does_not_hide_independent_body_content(self):
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "stamp_and_text.png"
+            image = Image.new("RGB", (1000, 1400), "white")
+            draw = ImageDraw.Draw(image)
+            draw.ellipse((350, 850, 650, 1150), outline=(180, 30, 50), width=18)
+            draw.rectangle((150, 250, 850, 285), fill="black")
+            image.save(image_path)
+            self.assertFalse(is_blank_page_after_masking(
+                image_path, [(0.32, 0.58, 0.68, 0.85)],
+            ))
+
+    def test_blank_page_skips_qwen_and_markdown_page_block(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "input.pdf"
+            pdf_path.write_bytes(b"pdf")
+            image_path = root / "page_1.png"
+            Image.new("RGB", (800, 1200), "white").save(image_path)
+            client = Mock()
+            with (
+                patch("app.core.batch_ocr.pdf_page_count", return_value=1),
+                patch("app.core.batch_ocr.iter_render_pdf_to_images", return_value=iter([image_path])),
+                patch("app.core.batch_ocr.ENABLE_LAYOUT_DETECTION", False),
+            ):
+                result = process_single_pdf(pdf_path, root / "output", client, MODEL)
+            client.generate.assert_not_called()
+            self.assertEqual(result.read_text(encoding="utf-8"), "")
+
+    def test_qwen_verbose_blank_page_produces_no_text_marker_or_asset(self):
+        from PIL import Image
+
+        response = (
+            "The image provided is a scanned document page that appears to be mostly "
+            "blank, with very faint and possibly illegible text at the bottom. There "
+            "are two red circular stamps visible near the bottom center of the page. "
+            "One stamp contains the word 10HAY in reverse, indicating it was stamped "
+            "through paper, and the other has indistinct markings. Below these stamps, "
+            "there is extremely faint handwritten-style text that is too blurry to "
+            "transcribe accurately. Per your instructions: If the page contains no "
+            "visible document content, return an empty response. Do not describe the "
+            "blank page and do not explain that there is nothing to transcribe. Given "
+            "that the only potentially readable elements are minimal, reversed, or "
+            "ambiguous and do not constitute clear transcribable document content under "
+            "the stated OCR rules, I will return an empty response as required."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf_path = root / "input.pdf"
+            pdf_path.write_bytes(b"pdf")
+            image_path = root / "page_1.png"
+            Image.new("RGB", (800, 1200), "white").save(image_path)
+            output_dir = root / "output"
+            asset = output_dir / "images" / "page_1_stamp.png"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"temporary extracted graphic")
+            client = Mock()
+            client.generate.return_value = [SimpleNamespace(response=response)]
+            uncertain_metrics = {
+                "light_ratio": 0.99, "background_level": 250.0,
+                "adaptive_ink_ratio": 0.001, "stddev": 2.0,
+                "components": 2, "horizontal_rules": 0, "vertical_rules": 0,
+            }
+
+            with (
+                patch("app.core.batch_ocr.pdf_page_count", return_value=1),
+                patch("app.core.batch_ocr.iter_render_pdf_to_images", return_value=iter([image_path])),
+                patch("app.core.batch_ocr.classify_page_image", return_value=("uncertain", uncertain_metrics)),
+                patch("app.core.batch_ocr.orient_page_file", return_value=0),
+                patch("app.core.batch_ocr.extract_images_from_page", return_value=["images/page_1_stamp.png"]),
+                patch("app.core.layout_detector.create_layout_detector", return_value=(None, "disabled for test")),
+            ):
+                result = process_single_pdf(pdf_path, output_dir, client, MODEL)
+
+            self.assertEqual(client.generate.call_count, 1)
+            self.assertEqual(result.read_bytes(), b"")
+            self.assertFalse(asset.exists())
+
     def test_repairs_escaped_image_parenthesis_and_underscores_only(self):
         markdown = (
             r"    ![Ảnh minh họa]\(images/tai\_lieu\_page\_1.png)" "\n"
@@ -78,11 +208,15 @@ class BatchOcrTests(unittest.TestCase):
         self.assertIn("classify_1024", sent_images[0])
         self.assertIn("classify_768", sent_images[1])
 
-    def test_graphic_is_deleted_only_at_strict_confidence(self):
+    def test_graphic_is_deleted_only_at_safe_category_confidence(self):
         from app.core.batch_ocr import _discard_classified_graphic
-        self.assertTrue(_discard_classified_graphic("signature", 0.98))
-        self.assertTrue(_discard_classified_graphic("stamp", 0.99))
-        self.assertFalse(_discard_classified_graphic("signature", 0.97))
+        self.assertTrue(_discard_classified_graphic("signature", 0.90))
+        self.assertTrue(_discard_classified_graphic("stamp", 0.95))
+        self.assertTrue(_discard_classified_graphic("text_fragment", 0.95))
+        self.assertTrue(_discard_classified_graphic("page_canvas", 0.96))
+        self.assertTrue(_discard_classified_graphic("decoration", 0.95))
+        self.assertFalse(_discard_classified_graphic("signature", 0.89))
+        self.assertFalse(_discard_classified_graphic("decoration", 0.94))
         self.assertFalse(_discard_classified_graphic("uncertain", 1.0))
         self.assertFalse(_discard_classified_graphic("content_image", 1.0))
         self.assertFalse(_discard_classified_graphic("logo", 1.0))
@@ -322,6 +456,102 @@ class BatchOcrTests(unittest.TestCase):
     def test_unclosed_math_marker_is_removed_from_prose(self):
         malformed = "$2109 đô la Mỹ, và giá trị HDI là 0,666 đứng thứ 116 trong số 188 nước"
         self.assertNotIn("$", clean_markdown(malformed))
+
+    def test_blank_page_assistant_explanation_becomes_empty_markdown(self):
+        response = (
+            "The provided image appears to be a blank page with no visible text "
+            "or content. Therefore, there is nothing to transcribe into Markdown "
+            "format. If you have another image, please provide it."
+        )
+        self.assertEqual(clean_markdown(response), "")
+
+    def test_qwen_empty_response_placeholder_becomes_empty_markdown(self):
+        from app.core.batch_ocr import (
+            BlankOCRResult, is_blank_ocr_response, ocr_qwen_images,
+        )
+
+        self.assertTrue(is_blank_ocr_response("(Empty response)"))
+        self.assertEqual(clean_markdown("(Empty response)"), "")
+        client = Mock()
+        client.generate.return_value = [SimpleNamespace(response="(Empty response)")]
+        result = ocr_qwen_images(client, MODEL, [Path("page.png")])
+        self.assertIsInstance(result, BlankOCRResult)
+
+    def test_qwen_no_content_placeholder_becomes_empty_markdown(self):
+        from app.core.batch_ocr import is_blank_ocr_response
+
+        self.assertTrue(is_blank_ocr_response("(no content)"))
+        self.assertEqual(clean_markdown("(no content)"), "")
+
+    def test_qwen_completely_blank_explanation_becomes_empty_markdown(self):
+        response = (
+            "The provided image is completely blank and contains no visible text, "
+            "diagrams, tables, or other content. Therefore, according to the OCR-only "
+            "rules specified, there is nothing to transcribe.\n\n"
+            "**Output:**\n\n(no content)"
+        )
+        self.assertEqual(clean_markdown(response), "")
+
+    def test_qwen_repeated_heading_ladder_is_treated_as_blank_failure(self):
+        from app.core.batch_ocr import (
+            BlankOCRResult, is_blank_ocr_response, ocr_qwen_images,
+        )
+
+        response = "\n\n".join(
+            f"{'#' * level} 10/24/2023" for level in range(1, 6)
+        )
+        self.assertTrue(is_blank_ocr_response(response))
+        self.assertEqual(clean_markdown(response), "")
+        client = Mock()
+        client.generate.return_value = [SimpleNamespace(response=response)]
+        result = ocr_qwen_images(client, MODEL, [Path("page.png")])
+        self.assertIsInstance(result, BlankOCRResult)
+
+    def test_qwen_verbose_blank_instruction_echo_is_treated_as_blank_failure(self):
+        from app.core.batch_ocr import (
+            BlankOCRResult, is_blank_ocr_response, ocr_qwen_images,
+        )
+
+        response = (
+            "The image provided is a scanned document page that appears to be mostly "
+            "blank, with very faint and possibly illegible text at the bottom. There "
+            "are two red circular stamps visible near the bottom center of the page. "
+            "One stamp contains the word 10HAY in reverse, and the other has indistinct "
+            "markings. Below these stamps, there is extremely faint text that is too "
+            "blurry to transcribe accurately. "
+            "Per your instructions: If the page contains no visible document content, "
+            "return an empty response. Do not describe the blank page and do not explain "
+            "that there is nothing to transcribe. Given that the only potentially "
+            "readable elements are minimal, reversed, or ambiguous and do not constitute "
+            "clear transcribable document content under the stated OCR rules, I will "
+            "return an empty response as required."
+        )
+        self.assertGreater(len(response.split()), 120)
+        self.assertTrue(is_blank_ocr_response(response))
+        self.assertEqual(clean_markdown(response), "")
+        client = Mock()
+        client.generate.return_value = [SimpleNamespace(response=response)]
+        result = ocr_qwen_images(client, MODEL, [Path("page.png")])
+        self.assertIsInstance(result, BlankOCRResult)
+
+    def test_document_sentence_about_blank_page_is_not_removed(self):
+        document = (
+            "# Hướng dẫn\n\nTrang trắng được dùng để phân cách các phụ lục. "
+            "Nội dung này phải được giữ nguyên trong tài liệu."
+        )
+        self.assertEqual(clean_markdown(document), document)
+
+    def test_qwen_blank_response_has_explicit_empty_result_state(self):
+        from app.core.batch_ocr import BlankOCRResult, ocr_qwen_images
+
+        client = Mock()
+        client.generate.return_value = [SimpleNamespace(response=(
+            "The provided image appears to be a blank page with no visible text. "
+            "There is nothing to transcribe into Markdown format."
+        ))]
+        result = ocr_qwen_images(client, MODEL, [Path("page.png")])
+        self.assertIsInstance(result, BlankOCRResult)
+        self.assertEqual(result, "")
 
     def test_low_diacritic_vietnamese_requests_vision_retry(self):
         malformed = "Viet Nam la nuoc co muc thu nhap trung binh va chuong trinh trong nam. " * 12
@@ -615,10 +845,31 @@ class BatchOcrTests(unittest.TestCase):
         from app.core.batch_ocr import apply_page_assets
 
         result = apply_page_assets(
-            "![Chữ ký](image_placeholder.png)", 1,
+            "![Sơ đồ quy trình](image_placeholder.png)", 1,
             ["images/report_page_1_draw_2.png"],
         )
         self.assertIn("draw_2.png", result)
+
+    def test_signature_and_stamp_alt_text_removes_link_after_asset_placement(self):
+        from app.core.batch_ocr import apply_page_assets
+
+        result = apply_page_assets(
+            "Nội dung\n\n![Seal and Signature](image_placeholder.png)",
+            1, ["images/document_page_1_layout_img_1.png"],
+        )
+        self.assertNotIn("layout_img_1.png", result)
+        self.assertNotIn("Seal and Signature", result)
+        self.assertIn("Nội dung", result)
+
+    def test_logo_alt_text_is_not_removed(self):
+        from app.core.batch_ocr import apply_page_assets
+
+        result = apply_page_assets(
+            "![University Logo](image_placeholder.png)",
+            1, ["images/document_page_1_layout_img_1.png"],
+        )
+        self.assertIn("University Logo", result)
+        self.assertIn("layout_img_1.png", result)
 
     def test_unplaced_bitmaps_are_preserved_without_layout_blocks(self):
         from app.core.batch_ocr import apply_page_assets
@@ -961,7 +1212,10 @@ class BatchOcrTests(unittest.TestCase):
             pdf_path.write_bytes(b"pdf")
             
             output_dir = Path(temp_dir) / "output"
-            result = process_single_pdf(pdf_path, output_dir, client, "qwen3.5:4b")
+            result = process_single_pdf(
+                pdf_path, output_dir, client, "qwen3.5:4b",
+                skip_blank_pages=False,
+            )
             
             # Read output markdown
             md_content = result.read_text(encoding="utf-8")

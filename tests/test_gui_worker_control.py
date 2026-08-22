@@ -41,6 +41,24 @@ class GuiWorkerControlTests(unittest.TestCase):
             threading.Event(), threading.Event(), "qwen3.5:4b", workers=4,
         )
         self.assertEqual(worker.workers, 2)
+        self.assertTrue(worker.skip_blank_pages)
+        self.assertEqual(worker.blank_detection_sensitivity, "safe")
+
+    def test_blank_page_skipping_can_be_disabled(self):
+        worker = OCRWorker(
+            Path("input.pdf"), Path("output"), queue.Queue(),
+            threading.Event(), threading.Event(), "qwen3.5:4b",
+            skip_blank_pages=False,
+        )
+        self.assertFalse(worker.skip_blank_pages)
+
+    def test_blank_page_sensitivity_accepts_vietnamese_gui_labels(self):
+        worker = OCRWorker(
+            Path("input.pdf"), Path("output"), queue.Queue(),
+            threading.Event(), threading.Event(), "qwen3.5:4b",
+            blank_detection_sensitivity="Mạnh mẽ",
+        )
+        self.assertEqual(worker.blank_detection_sensitivity, "aggressive")
 
     def test_shared_qwen_request_guard_honors_cancellation(self):
         stop_event = threading.Event()

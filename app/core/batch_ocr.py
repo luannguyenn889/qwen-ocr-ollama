@@ -43,7 +43,7 @@ import pymupdf  # PyMuPDF
 # pyrefly: ignore [missing-import]
 from ollama import Client
 # pyrefly: ignore [missing-import]
-from PIL import Image
+from PIL import Image, ImageStat
 from io import BytesIO
 
 MODEL = "qwen3.5:4b"
@@ -53,14 +53,25 @@ OLLAMA_REQUEST_TIMEOUT_SECONDS = 300.0
 class PipelineCancelled(Exception):
     """Raised internally when a frontend cancels a shared pipeline operation."""
 
+
+class BlankOCRResult(str):
+    """Empty OCR text explicitly confirmed by the vision model."""
+
+
 BoundingBox = tuple[float, float, float, float]
 
 # Đặt False để bỏ qua Paddle layout detection và buộc gửi cả trang đầy đủ cho Qwen
 ENABLE_LAYOUT_DETECTION = True
 
 # Persist genuine content images beside Markdown. Temporary review/layout
-# crops remain ephemeral; signature/stamp regions are filtered separately.
+# review crops remain ephemeral; signature/stamp regions are not emitted as assets.
 TEXT_ONLY_OUTPUT = False
+
+# The classifier is explicitly instructed to return ``logo`` or ``uncertain``
+# when a circular logo cannot be distinguished safely from an ink stamp.  A
+# genuine ``stamp``/``signature`` result is therefore actionable from 0.90;
+# requiring 0.98 caused verified stamps in faint scans to be emitted as images.
+SIGNATURE_STAMP_CONFIDENCE = 0.90
 
 # DPI độ phân giải cao hơn dành riêng cho các trang có bảng biểu được nhận diện
 TABLE_RENDER_DPI = 300
@@ -70,6 +81,536 @@ IMAGE_PLACEHOLDER_TARGET_RE = r"(?:[^\s)'\"]*/)?image_placeholder(?:\.[A-Za-z0-9
 
 _orientation_classifier = None
 _orientation_classifier_lock = threading.Lock()
+
+
+BLANK_DETECTION_SENSITIVITIES = ("safe", "standard", "aggressive")
+
+_BLANK_DETECTION_PROFILES = {
+    # Safe is deliberately conservative: it clears only strong edge artifacts
+    # and does not treat ruled paper as blank. This remains the default.
+    "safe": {
+        "base_margin": 0.02,
+        "max_border": 0.09,
+        "border_occupancy": 0.68,
+        "edge_band": 0.045,
+        "min_contrast": 28,
+        "min_background": 235,
+        "min_colored_background": 225,
+        "min_component_area": 0.000012,
+        "rule_lines": 10_000,
+        "blank_ink_ratio": 0.00010,
+    },
+    "standard": {
+        "base_margin": 0.02,
+        "max_border": 0.10,
+        "border_occupancy": 0.45,
+        "edge_band": 0.075,
+        "min_contrast": 21,
+        "min_background": 215,
+        "min_colored_background": 185,
+        "min_component_area": 0.000020,
+        "rule_lines": 12,
+        "blank_ink_ratio": 0.00020,
+    },
+    "aggressive": {
+        "base_margin": 0.02,
+        "max_border": 0.12,
+        "border_occupancy": 0.30,
+        "edge_band": 0.105,
+        "min_contrast": 15,
+        "min_background": 175,
+        "min_colored_background": 145,
+        "min_component_area": 0.000032,
+        "rule_lines": 5,
+        "blank_ink_ratio": 0.00035,
+    },
+}
+
+
+def normalize_blank_detection_sensitivity(value: str | None) -> str:
+    """Return one canonical blank-page sensitivity name."""
+    normalized = str(value or "safe").strip().casefold()
+    aliases = {
+        "safe": "safe", "an toàn": "safe", "an toan": "safe",
+        "standard": "standard", "chuẩn": "standard", "chuan": "standard",
+        "aggressive": "aggressive", "mạnh mẽ": "aggressive",
+        "manh me": "aggressive", "mạnh": "aggressive", "manh": "aggressive",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        choices = ", ".join(BLANK_DETECTION_SENSITIVITIES)
+        raise ValueError(
+            f"blank detection sensitivity must be one of: {choices}"
+        ) from error
+
+
+def _edge_border_depth(values, background: float, maximum: int, occupancy: float) -> int:
+    """Measure a continuous dark scanner band beginning at one image edge."""
+    import numpy as np
+
+    if maximum <= 0 or values.size == 0:
+        return 0
+    dark_threshold = max(0.0, min(220.0, background - 24.0))
+    depth = 0
+    clean_run = 0
+    for index in range(min(maximum, values.shape[0])):
+        strip = values[index]
+        dark_share = float(np.count_nonzero(strip < dark_threshold)) / max(strip.size, 1)
+        strip_median = float(np.median(strip))
+        if dark_share >= occupancy or strip_median <= background - 35.0:
+            depth = index + 1
+            clean_run = 0
+        elif depth:
+            clean_run += 1
+            if clean_run >= 2:
+                break
+        else:
+            break
+    return depth
+
+
+def _crop_scanner_borders(gray_pixels, profile: dict[str, float | int]):
+    """Crop fixed safety margins plus any continuous dark scanner border."""
+    import numpy as np
+
+    height, width = gray_pixels.shape
+    background = float(np.percentile(gray_pixels, 90))
+    max_x = max(1, int(width * float(profile["max_border"])))
+    max_y = max(1, int(height * float(profile["max_border"])))
+    occupancy = float(profile["border_occupancy"])
+    left_dark = _edge_border_depth(gray_pixels.T, background, max_x, occupancy)
+    right_dark = _edge_border_depth(gray_pixels[:, ::-1].T, background, max_x, occupancy)
+    top_dark = _edge_border_depth(gray_pixels, background, max_y, occupancy)
+    bottom_dark = _edge_border_depth(gray_pixels[::-1], background, max_y, occupancy)
+    base_x = max(1, int(width * float(profile["base_margin"])))
+    base_y = max(1, int(height * float(profile["base_margin"])))
+    left, right = max(base_x, left_dark), max(base_x, right_dark)
+    top, bottom = max(base_y, top_dark), max(base_y, bottom_dark)
+    # Invalid or over-eager estimates are ignored instead of risking content.
+    if left + right >= width * 0.25:
+        left = right = base_x
+    if top + bottom >= height * 0.25:
+        top = bottom = base_y
+    cropped = gray_pixels[top:height - bottom, left:width - right]
+    removed_ratio = 1.0 - (cropped.size / max(gray_pixels.size, 1))
+    return cropped, (left, top, right, bottom), removed_ratio
+
+
+def _remove_edge_artifacts(ink, profile: dict[str, float | int]):
+    """Remove border remnants, binding marks and punch holes from an ink mask."""
+    import cv2
+    import numpy as np
+
+    cleaned = ink.copy()
+    height, width = cleaned.shape
+    total = max(height * width, 1)
+    edge_x = max(2, int(width * float(profile["edge_band"])))
+    edge_y = max(2, int(height * float(profile["edge_band"])))
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(cleaned, 8)
+    broad_scan_fold_count = sum(
+        1
+        for index in range(1, count)
+        if (
+            (int(stats[index][cv2.CC_STAT_WIDTH]) >= width * 0.82
+             and int(stats[index][cv2.CC_STAT_HEIGHT]) <= height * 0.035)
+            or (int(stats[index][cv2.CC_STAT_HEIGHT]) >= height * 0.82
+                and int(stats[index][cv2.CC_STAT_WIDTH]) <= width * 0.035)
+        )
+    )
+    removed_pixels = 0
+    removed_components = 0
+    for index in range(1, count):
+        x, y, box_width, box_height, area = map(int, stats[index])
+        touches_side = x <= 1 or x + box_width >= width - 1
+        touches_top_bottom = y <= 1 or y + box_height >= height - 1
+        near_side = x <= edge_x or x + box_width >= width - edge_x
+        near_top_bottom = y <= edge_y or y + box_height >= height - edge_y
+        broad_edge_band = (
+            (box_width >= width * 0.65 and near_top_bottom and box_height <= height * 0.14)
+            or (box_height >= height * 0.65 and near_side and box_width <= width * 0.14)
+            or ((touches_side or touches_top_bottom)
+                and (box_width >= width * 0.88 or box_height >= height * 0.88))
+        )
+        broad_scan_fold = (
+            (box_width >= width * 0.82 and box_height <= height * 0.035)
+            or (box_height >= height * 0.82 and box_width <= width * 0.035)
+        )
+        box_area = max(box_width * box_height, 1)
+        aspect = box_width / max(box_height, 1)
+        fill = area / box_area
+        punch_hole = (
+            near_side
+            and 0.45 <= aspect <= 2.20
+            and total * 0.00002 <= box_area <= total * 0.008
+            and fill >= 0.10
+        )
+        staple_mark = (
+            near_side
+            and box_area <= total * 0.002
+            and box_width <= width * 0.07
+            and box_height <= height * 0.07
+            and 0.16 <= aspect <= 6.0
+        )
+        if (
+            broad_edge_band
+            or (broad_scan_fold and broad_scan_fold_count <= 2)
+            or punch_hole
+            or staple_mark
+        ):
+            cleaned[labels == index] = 0
+            removed_pixels += area
+            removed_components += 1
+    return cleaned, removed_pixels, removed_components
+
+
+def _remove_repeated_rule_lines(ink, profile: dict[str, float | int]):
+    """Remove repeated long lines characteristic of lined or grid paper."""
+    import cv2
+    import numpy as np
+
+    height, width = ink.shape
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(25, int(width * 0.35)), 1)
+    )
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (1, max(25, int(height * 0.35)))
+    )
+    horizontal = cv2.morphologyEx(ink, cv2.MORPH_OPEN, horizontal_kernel)
+    vertical = cv2.morphologyEx(ink, cv2.MORPH_OPEN, vertical_kernel)
+
+    def count_long_lines(mask, *, horizontal_axis: bool) -> int:
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+        positions = []
+        for index in range(1, count):
+            x, y, box_width, box_height, _area = map(int, stats[index])
+            if horizontal_axis:
+                if box_width >= width * 0.55 and box_height <= max(8, height * 0.012):
+                    positions.append(y + box_height // 2)
+            elif box_height >= height * 0.55 and box_width <= max(8, width * 0.012):
+                positions.append(x + box_width // 2)
+        positions.sort()
+        clustered = []
+        tolerance = max(2, int((height if horizontal_axis else width) * 0.003))
+        for position in positions:
+            if not clustered or position - clustered[-1] > tolerance:
+                clustered.append(position)
+        return len(clustered)
+
+    horizontal_count = count_long_lines(horizontal, horizontal_axis=True)
+    vertical_count = count_long_lines(vertical, horizontal_axis=False)
+    minimum = int(profile["rule_lines"])
+    remove_horizontal = horizontal_count >= minimum
+    remove_vertical = vertical_count >= minimum
+    if not remove_horizontal and not remove_vertical:
+        return ink, horizontal_count, vertical_count, 0
+    line_mask = np.zeros_like(ink)
+    if remove_horizontal:
+        line_mask = cv2.bitwise_or(line_mask, horizontal)
+    if remove_vertical:
+        line_mask = cv2.bitwise_or(line_mask, vertical)
+    line_mask = cv2.dilate(line_mask, np.ones((3, 3), dtype="uint8"), iterations=1)
+    cleaned = ink.copy()
+    removed_pixels = int(np.count_nonzero(cleaned[line_mask > 0]))
+    cleaned[line_mask > 0] = 0
+    return cleaned, horizontal_count, vertical_count, removed_pixels
+
+
+def _classify_blank_image(
+    source: Image.Image, sensitivity: str = "safe",
+) -> tuple[str, dict[str, float | int]]:
+    """Return ``blank``, ``content`` or ``uncertain`` with diagnostics."""
+    sensitivity = normalize_blank_detection_sensitivity(sensitivity)
+    profile = _BLANK_DETECTION_PROFILES[sensitivity]
+    image = source.convert("RGB")
+    image.thumbnail((1600, 1600), Image.Resampling.BILINEAR)
+    gray = image.convert("L")
+    histogram = gray.histogram()
+    total_before_crop = max(sum(histogram), 1)
+    light_ratio = sum(histogram[235:]) / total_before_crop
+    strong_ink_ratio = sum(histogram[:180]) / total_before_crop
+    stddev = float(ImageStat.Stat(gray).stddev[0])
+
+    meaningful_components = -1
+    large_components = -1
+    metrics: dict[str, float | int] = {
+        "light_ratio": light_ratio,
+        "strong_ink_ratio": strong_ink_ratio,
+        "stddev": stddev,
+        "components": meaningful_components,
+        "large_components": large_components,
+        "background_level": 0.0,
+        "paper_chroma": 0.0,
+        "adaptive_ink_ratio": 1.0,
+        "border_crop_ratio": 0.0,
+        "edge_artifacts": 0,
+        "edge_artifact_ratio": 0.0,
+        "horizontal_rules": 0,
+        "vertical_rules": 0,
+        "rule_line_ratio": 0.0,
+    }
+    try:
+        import cv2
+        import numpy as np
+
+        gray_pixels = np.asarray(gray)
+        rgb_pixels = np.asarray(image)
+        cropped, (left, top, right, bottom), border_ratio = _crop_scanner_borders(
+            gray_pixels, profile
+        )
+        cropped_rgb = rgb_pixels[top:rgb_pixels.shape[0] - bottom,
+                                 left:rgb_pixels.shape[1] - right]
+        height, width = cropped.shape
+        total = max(cropped.size, 1)
+        background_level = float(np.percentile(cropped, 90))
+        median_rgb = np.median(cropped_rgb.reshape(-1, 3), axis=0)
+        paper_chroma = float(median_rgb.max() - median_rgb.min())
+
+        # Local background subtraction makes the decision independent of white
+        # balance and suppresses faint bleed-through without erasing real ink.
+        sigma = max(5.0, min(height, width) / 85.0)
+        local_background = cv2.GaussianBlur(cropped, (0, 0), sigmaX=sigma, sigmaY=sigma)
+        darkness = np.maximum(
+            local_background.astype("int16") - cropped.astype("int16"), 0
+        ).astype("uint8")
+        otsu_threshold, _unused = cv2.threshold(
+            darkness, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+        ink_threshold = max(
+            int(profile["min_contrast"]), min(int(round(otsu_threshold)), 60)
+        )
+        ink = (darkness >= ink_threshold).astype("uint8")
+        ink, edge_pixels, edge_components = _remove_edge_artifacts(ink, profile)
+        ink, horizontal_rules, vertical_rules, rule_pixels = _remove_repeated_rule_lines(
+            ink, profile
+        )
+        adaptive_ink_ratio = float(np.count_nonzero(ink)) / total
+        minimum_area = max(30, int(total * float(profile["min_component_area"])))
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(ink, 8)
+        meaningful_components = 0
+        large_components = 0
+        for index in range(1, count):
+            _x, _y, box_width, box_height, area = map(int, stats[index])
+            if area < minimum_area or box_width < 2 or box_height < 3:
+                continue
+            meaningful_components += 1
+            if area >= max(100, minimum_area * 3):
+                large_components += 1
+
+        metrics.update({
+            "components": meaningful_components,
+            "large_components": large_components,
+            "background_level": background_level,
+            "paper_chroma": paper_chroma,
+            "adaptive_ink_ratio": adaptive_ink_ratio,
+            "border_crop_ratio": border_ratio,
+            "edge_artifacts": edge_components,
+            "edge_artifact_ratio": edge_pixels / total,
+            "horizontal_rules": horizontal_rules,
+            "vertical_rules": vertical_rules,
+            "rule_line_ratio": rule_pixels / total,
+        })
+        acceptable_background = (
+            background_level >= float(profile["min_background"])
+            or (
+                paper_chroma >= 8.0
+                and background_level >= float(profile["min_colored_background"])
+            )
+        )
+        clearly_blank = (
+            acceptable_background
+            and meaningful_components == 0
+            and adaptive_ink_ratio <= float(profile["blank_ink_ratio"])
+        )
+        if clearly_blank:
+            return "blank", metrics
+        clearly_content = (
+            large_components > 0
+            or meaningful_components >= 3
+            or adaptive_ink_ratio > 0.0025
+        )
+        return ("content" if clearly_content else "uncertain"), metrics
+    except Exception:
+        # OpenCV is optional at runtime. The conservative aggregate fallback
+        # can skip only pristine light pages; all other cases remain uncertain.
+        metrics["components"] = meaningful_components
+        metrics["large_components"] = large_components
+        clearly_blank = (
+            light_ratio >= 0.995
+            and strong_ink_ratio <= 0.0002
+            and stddev <= 4.0
+        )
+        return ("blank" if clearly_blank else "uncertain"), metrics
+
+
+def is_blank_page(image_path: str | Path, sensitivity: str = "safe") -> bool:
+    """Return True only for a blank page; invalid images are never discarded."""
+    sensitivity = normalize_blank_detection_sensitivity(sensitivity)
+    try:
+        with Image.open(image_path) as source:
+            return _classify_blank_image(source, sensitivity)[0] == "blank"
+    except Exception:
+        return False
+
+
+def classify_page_image(
+    image_path: str | Path, sensitivity: str = "safe",
+) -> tuple[str, dict[str, float | int]]:
+    """Classify a rendered page; unreadable input is always ``uncertain``."""
+    sensitivity = normalize_blank_detection_sensitivity(sensitivity)
+    try:
+        with Image.open(image_path) as source:
+            return _classify_blank_image(source, sensitivity)
+    except Exception:
+        return "uncertain", {}
+
+
+def is_blank_pdf_page(page) -> bool:
+    """Fast, conservative structural check for truly empty digital PDF pages."""
+    try:
+        if str(page.get_text() or "").strip():
+            return False
+        if page.get_images(full=True) or page.get_drawings():
+            return False
+        if list(page.annots() or ()) or list(page.widgets() or ()):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def is_blank_page_after_masking(
+    image_path: str | Path, normalized_regions: list[BoundingBox],
+    sensitivity: str = "safe",
+) -> bool:
+    """Check whether a page becomes blank after removing proven graphic regions."""
+    if not normalized_regions:
+        return False
+    sensitivity = normalize_blank_detection_sensitivity(sensitivity)
+    try:
+        with Image.open(image_path) as source:
+            masked = source.convert("RGB")
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(masked)
+            for left, top, right, bottom in normalized_regions:
+                draw.rectangle((
+                    max(0, int(left * masked.width)),
+                    max(0, int(top * masked.height)),
+                    min(masked.width, int(right * masked.width) + 1),
+                    min(masked.height, int(bottom * masked.height) + 1),
+                ), fill="white")
+            return _classify_blank_image(masked, sensitivity)[0] == "blank"
+    except Exception:
+        return False
+
+
+def find_isolated_chromatic_graphics(
+    image_path: str | Path, max_regions: int = 4,
+) -> list[BoundingBox]:
+    """Locate compact coloured-ink clusters on an otherwise pale page.
+
+    This is a conservative fallback for scan canvases where layout detection
+    cannot expose stamps as separate image regions. It only proposes crops;
+    the vision classifier still decides whether each is a stamp/signature.
+    """
+    if max_regions < 1:
+        return []
+    try:
+        import cv2
+        import numpy as np
+
+        with Image.open(image_path) as source:
+            image = source.convert("RGB")
+            image.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+            pixels = np.asarray(image)
+        height, width = pixels.shape[:2]
+        total = max(height * width, 1)
+        high = pixels.max(axis=2)
+        low = pixels.min(axis=2)
+        chromatic = (
+            (high.astype("int16") - low.astype("int16") >= 24) & (low < 235)
+        ).astype("uint8")
+        if int(chromatic.sum()) < max(40, int(total * 0.00002)):
+            return []
+
+        # A wider join keeps a circular stamp and its detached lettering in
+        # one proposal instead of masking only one arc of the same stamp.
+        kernel_size = max(5, int(round(min(width, height) * 0.014)))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+        joined = cv2.dilate(chromatic, kernel, iterations=1)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(joined, 8)
+        candidates = []
+        for index in range(1, count):
+            x, y, box_width, box_height, _joined_area = map(int, stats[index])
+            box_area = box_width * box_height
+            if not (total * 0.0003 <= box_area <= total * 0.15):
+                continue
+            if box_width < width * 0.015 or box_height < height * 0.015:
+                continue
+            ink_count = int(
+                (chromatic[y:y + box_height, x:x + box_width] > 0).sum()
+            )
+            if ink_count < max(40, int(total * 0.00002)):
+                continue
+            candidates.append((ink_count, x, y, box_width, box_height))
+        if not candidates:
+            return []
+
+        # Disconnected rings, letters and seal emblems can have overlapping
+        # bounding boxes while remaining separate connected components. Merge
+        # nearby proposals so the later white mask covers the complete mark.
+        merge_gap = max(3, int(round(min(width, height) * 0.018)))
+        groups: list[list[int]] = []
+        for ink_count, x, y, box_width, box_height in sorted(candidates, reverse=True):
+            right, bottom = x + box_width, y + box_height
+            matching = []
+            for group_index, group in enumerate(groups):
+                _group_ink, gx0, gy0, gx1, gy1 = group
+                if not (
+                    right + merge_gap < gx0 or gx1 + merge_gap < x
+                    or bottom + merge_gap < gy0 or gy1 + merge_gap < y
+                ):
+                    matching.append(group_index)
+            if not matching:
+                groups.append([ink_count, x, y, right, bottom])
+                continue
+            first = matching[0]
+            group = groups[first]
+            group[0] += ink_count
+            group[1] = min(group[1], x)
+            group[2] = min(group[2], y)
+            group[3] = max(group[3], right)
+            group[4] = max(group[4], bottom)
+            for group_index in reversed(matching[1:]):
+                other = groups.pop(group_index)
+                group[0] += other[0]
+                group[1] = min(group[1], other[1])
+                group[2] = min(group[2], other[2])
+                group[3] = max(group[3], other[3])
+                group[4] = max(group[4], other[4])
+
+        padding = max(4, int(round(min(width, height) * 0.01)))
+        regions = []
+        for _ink, left, top, right, bottom in sorted(groups, reverse=True)[:max_regions]:
+            regions.append((
+                max(0, left - padding) / width,
+                max(0, top - padding) / height,
+                min(width, right + padding) / width,
+                min(height, bottom + padding) / height,
+            ))
+        return regions
+    except Exception:
+        return []
+
+
+def find_isolated_chromatic_graphic(
+    image_path: str | Path,
+) -> BoundingBox | None:
+    """Backward-compatible single-region wrapper."""
+    regions = find_isolated_chromatic_graphics(image_path, max_regions=1)
+    return regions[0] if regions else None
 
 
 def _orientation_result_data(result):
@@ -175,6 +716,8 @@ any new content. If the page is an exam or questionnaire, copy the questions
 and blank answer areas only. Output answers or solutions only when those exact
 words are visibly printed on the current image. When text is unclear, preserve
 the readable portion; do not guess or complete it from context.
+If the page contains no visible document content, return an empty response.
+Do not describe the blank page and do not explain that there is nothing to transcribe.
 
 Follow these strict structural and formatting guidelines:
 1. Document Structure & Layout:
@@ -198,18 +741,18 @@ Follow these strict structural and formatting guidelines:
    - Use `image_placeholder` only for genuine photographs, charts, logos, or primarily graphical illustrations.
    - Text boxes, callouts, framed notes, forms, and flowchart/diagram nodes containing text MUST be transcribed completely as Markdown (use blockquotes, lists, or tables where appropriate). Never replace their readable text with an image placeholder.
    - For a genuine figure that also contains readable labels, emit one image tag and transcribe its important visible text immediately below the tag.
-   - Layout labels are only hints. Never let an `image`, `figure`, `seal`, stamp,
-     signature, drawing, or overlapping graphic region suppress readable text.
-     Transcribe every readable linguistic text element first, regardless of the
-     document type or where it appears (including text beside or underneath a
-     stamp/signature and text printed inside a graphic).
+   - Layout labels are only hints for ordinary content graphics. Never let an
+     `image`, `figure`, drawing, or overlapping graphic region suppress readable
+     body text. A signature/stamp confirmation block is excluded as a whole,
+     including its signing title, signer name, handwritten strokes, seal and any
+     printed text belonging to that confirmation block.
    - Do not turn non-text pen strokes, signature flourishes, or stamp artwork
      into invented words. Transcribe handwriting only when it is genuinely
      readable as text. Transcribe text inside a stamp only when the characters
      are clear enough to read without guessing.
-   - Do not emit an image tag for a signature or stamp by default. Do not add an
-     evidence note such as `[Signed and stamped]` unless a separate instruction
-     explicitly requests it.
+   - Do not emit an image tag or transcribe text belonging to a signature/stamp
+     confirmation block. Do not add an evidence note such as `[Signed and stamped]`
+     unless a separate instruction explicitly requests it.
 
 4. General Rules:
    - Keep the original text exactly as written, preserving the language (Vietnamese, English, etc.) and spelling.
@@ -373,7 +916,9 @@ def _keep_vector_drawing(rect, page_width: float, page_height: float) -> bool:
     if rect.is_empty or rect.width <= 10 or rect.height <= 10:
         return False
     aspect_ratio = rect.width / max(rect.height, 0.001)
-    if aspect_ratio > 12 or aspect_ratio < 0.08:
+    if aspect_ratio > 12 or aspect_ratio < 0.20:
+        return False
+    if rect.width < page_width * 0.035 or rect.height < page_height * 0.025:
         return False
     if rect.y0 < page_height * 0.05 or rect.y1 > page_height * 0.95:
         return False
@@ -422,10 +967,12 @@ def classify_graphic_crop(client, model: str, crop_path: Path, *, before_request
     if before_request is not None:
         before_request()
     prompt = """Phân loại thành phần đồ họa trong ảnh crop; không OCR và không chép bất kỳ chữ nào.
-Chọn đúng một category: content_image, logo, signature, stamp, decoration, uncertain.
+Chọn đúng một category: content_image, logo, signature, stamp, text_fragment, decoration, page_canvas, uncertain.
 content_image gồm ảnh chụp, biểu đồ, sơ đồ hoặc hình minh họa.
 logo gồm biểu trưng cơ quan/thương hiệu, huy hiệu, logo tròn hoặc logo có chữ được thiết kế sạch.
 stamp chỉ là dấu mực thực sự đóng lên tài liệu, thường có nét mực không đều, chồng lên chữ/nền giấy.
+text_fragment là mảnh chữ, đường kẻ hoặc một phần textbox bị cắt rời, không phải hình minh họa độc lập.
+page_canvas là ảnh nền hoặc ảnh gần như chứa toàn bộ trang, làm lặp nội dung OCR của trang.
 Không được chọn stamp chỉ vì logo có hình tròn hoặc tên cơ quan. Nếu không phân biệt chắc logo và con dấu,
 phải chọn logo hoặc uncertain; chỉ chọn signature/stamp khi hình ảnh chứng minh rõ.
 Chỉ trả JSON: {"category":"...","confidence":0.0}"""
@@ -466,14 +1013,41 @@ Chỉ trả JSON: {"category":"...","confidence":0.0}"""
     finally:
         for temporary_image in temporary_images:
             temporary_image.unlink(missing_ok=True)
-    allowed = {"content_image", "logo", "signature", "stamp", "decoration", "uncertain"}
+    allowed = {
+        "content_image", "logo", "signature", "stamp", "text_fragment",
+        "decoration", "page_canvas", "uncertain",
+    }
     return (category if category in allowed else "uncertain"), confidence
+
+
+def is_confirmed_signature_stamp(category: str, confidence: float) -> bool:
+    return (
+        category in {"signature", "stamp"}
+        and confidence >= SIGNATURE_STAMP_CONFIDENCE
+    )
 
 
 def _discard_classified_graphic(category: str, confidence: float) -> bool:
     return (
-        category in {"signature", "stamp"} and confidence >= 0.98
-    ) or (category == "decoration" and confidence >= 0.99)
+        is_confirmed_signature_stamp(category, confidence)
+    ) or (category in {"text_fragment", "decoration", "page_canvas"} and confidence >= 0.95)
+
+
+def remove_signature_stamp_links(markdown: str) -> str:
+    """Remove image links explicitly labelled as signatures or stamps."""
+    labels = {
+        "signature", "seal", "stamp", "seal and signature", "signature and seal",
+        "signature stamp", "stamp and signature", "chữ ký", "con dấu",
+        "chữ ký và con dấu", "con dấu và chữ ký",
+    }
+
+    def remove(match: re.Match[str]) -> str:
+        label = re.sub(r"\s+", " ", match.group(1)).strip().casefold()
+        label = re.sub(r"[.,:;!?()\[\]{}]+", "", label).strip()
+        return "" if label in labels else match.group(0)
+
+    markdown = re.sub(r"!\[([^\]\n]*)\]\(([^)\n]+)\)", remove, markdown, flags=re.IGNORECASE)
+    return re.sub(r"\n{3,}", "\n\n", markdown).strip()
 
 
 # Hàm trích xuất các hình ảnh từ PDF sử dụng PP-DocLayout hoặc PyMuPDF làm fallback
@@ -485,6 +1059,7 @@ def extract_images_from_page(
     detected_images: list[BoundingBox] | None = None,
     table_regions: list[BoundingBox] | None = None,
     graphic_classifier=None,
+    discarded_graphics_sink: list | None = None,
 ) -> list[str]:
     """Trích xuất hình ảnh trang bằng PP-DocLayout khi khả dụng; nếu không sẽ lùi về dùng PyMuPDF."""
     # pyrefly: ignore [missing-import]
@@ -534,11 +1109,45 @@ def extract_images_from_page(
                             left * page_width / img_width, top * page_height / img_height,
                             right * page_width / img_width, bottom * page_height / img_height,
                         )
+                        if _is_full_page_canvas(pdf_rect, page_width, page_height):
+                            isolated_regions = find_isolated_chromatic_graphics(
+                                page_image_path
+                            )
+                            if isolated_regions and graphic_classifier is not None:
+                                for isolated_idx, isolated in enumerate(isolated_regions, 1):
+                                    crop_path = output_img_dir / (
+                                        f"{prefix}_page_{page_index + 1}_isolated_"
+                                        f"graphic_{isolated_idx}.png"
+                                    )
+                                    with Image.open(page_image_path) as isolated_source:
+                                        isolated_source.crop((
+                                            isolated[0] * isolated_source.width,
+                                            isolated[1] * isolated_source.height,
+                                            isolated[2] * isolated_source.width,
+                                            isolated[3] * isolated_source.height,
+                                        )).save(crop_path)
+                                    category, confidence = graphic_classifier(crop_path)
+                                    crop_path.unlink(missing_ok=True)
+                                    if is_confirmed_signature_stamp(category, confidence):
+                                        if discarded_graphics_sink is not None:
+                                            discarded_graphics_sink.append((
+                                                category, confidence, isolated,
+                                            ))
+                                        print(
+                                            f"    -> Ignored confirmed {category} isolated "
+                                            f"from full-page scan canvas {img_idx}."
+                                        )
+                            print(f"    -> Ignored full-page layout canvas image {img_idx}.")
+                            continue
                         if _is_text_heavy_region(page, pdf_rect):
                             print(f"    -> Kept text-heavy layout region {img_idx} for OCR instead of cropping it as an image.")
                             continue
                         left, top, right, bottom = _padded_box(
                             (left, top, right, bottom), float(img_width), float(img_height)
+                        )
+                        norm_bbox = (
+                            left / img_width, top / img_height,
+                            right / img_width, bottom / img_height,
                         )
 
                         crop_path = output_img_dir / f"{prefix}_page_{page_index + 1}_layout_img_{img_idx}.png"
@@ -546,6 +1155,8 @@ def extract_images_from_page(
                         if _needs_graphic_classification(page, pdf_rect) and graphic_classifier is not None:
                             category, confidence = graphic_classifier(crop_path)
                             if _discard_classified_graphic(category, confidence):
+                                if discarded_graphics_sink is not None:
+                                    discarded_graphics_sink.append((category, confidence, norm_bbox))
                                 crop_path.unlink(missing_ok=True)
                                 print(f"    -> Ignored confirmed {category} layout region {img_idx}.")
                                 continue
@@ -553,13 +1164,6 @@ def extract_images_from_page(
                         accepted_images.append(bbox)
 
                         # Chuẩn hóa tọa độ về dải 0.0 - 1.0
-                        norm_bbox = (
-                            left / img_width,
-                            top / img_height,
-                            right / img_width,
-                            bottom / img_height
-                        )
-
                         extracted_items.append((f"images/{crop_path.name}", norm_bbox))
                 detected_images[:] = accepted_images
                 # The detector handled the candidate set even when every item
@@ -589,6 +1193,34 @@ def extract_images_from_page(
                 if rects:
                     r = rects[0]
                     if any(_is_full_page_canvas(rect, page_width, page_height) for rect in rects):
+                        isolated_regions = (
+                            find_isolated_chromatic_graphics(page_image_path)
+                            if page_image_path is not None else []
+                        )
+                        if isolated_regions and graphic_classifier is not None:
+                            for isolated_idx, isolated in enumerate(isolated_regions, 1):
+                                crop_path = output_img_dir / (
+                                    f"{prefix}_page_{page_index + 1}_fallback_"
+                                    f"isolated_graphic_{isolated_idx}.png"
+                                )
+                                with Image.open(page_image_path) as isolated_source:
+                                    isolated_source.crop((
+                                        isolated[0] * isolated_source.width,
+                                        isolated[1] * isolated_source.height,
+                                        isolated[2] * isolated_source.width,
+                                        isolated[3] * isolated_source.height,
+                                    )).save(crop_path)
+                                category, confidence = graphic_classifier(crop_path)
+                                crop_path.unlink(missing_ok=True)
+                                if is_confirmed_signature_stamp(category, confidence):
+                                    if discarded_graphics_sink is not None:
+                                        discarded_graphics_sink.append((
+                                            category, confidence, isolated,
+                                        ))
+                                    print(
+                                        f"    -> Ignored confirmed {category} isolated "
+                                        f"from full-page scan canvas {img_idx}."
+                                    )
                         print(f"    -> Ignored full-page scan canvas image {img_idx}.")
                         continue
                     # Tiny bitmap ornaments should not enter the generic image
@@ -619,6 +1251,8 @@ def extract_images_from_page(
                 if rects and _needs_graphic_classification(page, r) and graphic_classifier is not None:
                     category, confidence = graphic_classifier(img_path)
                     if _discard_classified_graphic(category, confidence):
+                        if discarded_graphics_sink is not None:
+                            discarded_graphics_sink.append((category, confidence, norm_bbox))
                         img_path.unlink(missing_ok=True)
                         print(f"    -> Ignored confirmed {category} raster image {img_idx}.")
                         continue
@@ -690,20 +1324,22 @@ def extract_images_from_page(
                     img_name = f"{prefix}_page_{page_index + 1}_draw_{c_idx}.png"
                     img_path = output_img_dir / img_name
                     pix.save(str(img_path))
-
-                    if _needs_graphic_classification(page, crop_rect) and graphic_classifier is not None:
-                        category, confidence = graphic_classifier(img_path)
-                        if _discard_classified_graphic(category, confidence):
-                            img_path.unlink(missing_ok=True)
-                            print(f"    -> Ignored confirmed {category} vector region {c_idx}.")
-                            continue
-
                     norm_bbox = (
                         crop_rect.x0 / page_width,
                         crop_rect.y0 / page_height,
                         crop_rect.x1 / page_width,
-                        crop_rect.y1 / page_height
+                        crop_rect.y1 / page_height,
                     )
+
+                    if _needs_graphic_classification(page, crop_rect) and graphic_classifier is not None:
+                        category, confidence = graphic_classifier(img_path)
+                        if _discard_classified_graphic(category, confidence):
+                            if discarded_graphics_sink is not None:
+                                discarded_graphics_sink.append((category, confidence, norm_bbox))
+                            img_path.unlink(missing_ok=True)
+                            print(f"    -> Ignored confirmed {category} vector region {c_idx}.")
+                            continue
+
                     normalized_tables = [
                         (box[0] / img_width, box[1] / img_height, box[2] / img_width, box[3] / img_height)
                         for box in table_regions or []
@@ -1255,6 +1891,7 @@ def apply_page_assets(
     pending_images = [path for path in image_paths if f"]({path})" not in markdown]
     markdown, _unplaced = link_extracted_images(markdown, pending_images)
     markdown = _insert_images_by_reading_order(markdown, image_paths, typed_blocks)
+    markdown = remove_signature_stamp_links(markdown)
     # Surplus placeholders have no valid asset and must never reach output.
     markdown = remove_orphan_image_placeholders(markdown)
     # Correct model-authored zero-based/stale generic page labels as well as
@@ -1324,6 +1961,82 @@ def deduplicate_exact_assets(
     return markdown, unique, removed
 
 
+# Các mô hình vision đôi khi mô tả trang trắng thay vì trả chuỗi rỗng. Chỉ coi
+# toàn bộ phản hồi ngắn mang rõ dấu hiệu lời giải thích của trợ lý là rỗng;
+# không xóa một câu tương tự nếu nó nằm trong nội dung tài liệu dài hơn.
+def is_blank_ocr_response(text: str) -> bool:
+    candidate = re.sub(r"^```[a-zA-Z0-9_-]*\s*|```\s*$", "", text.strip())
+    plain = re.sub(r"[*_`#>]", " ", candidate)
+    plain = re.sub(r"\s+", " ", plain).strip().casefold()
+    if not plain:
+        return True
+    # Some Ollama/Qwen builds materialize an otherwise empty generation as a
+    # short UI-style placeholder. It is an assistant status, never page text,
+    # but only discard it when it is the complete response.
+    placeholder = plain.strip("()[]{} .:-")
+    if placeholder in {"empty response", "no response", "no content"}:
+        return True
+    # A blank/near-blank image can make a vision model emit the same invented
+    # token as an ascending Markdown heading ladder (# value, ## value, ...).
+    # Treat it as a generation-status failure only when it is the *entire*
+    # response, has at least four consecutive heading levels, and every
+    # reader-visible payload is identical.
+    nonblank_lines = [line.strip() for line in candidate.splitlines() if line.strip()]
+    heading_ladder = [
+        re.fullmatch(r"(#{1,6})\s+(.+?)\s*", line)
+        for line in nonblank_lines
+    ]
+    if len(heading_ladder) >= 4 and all(heading_ladder):
+        levels = [len(match.group(1)) for match in heading_ladder]
+        payloads = [
+            re.sub(r"\s+", " ", match.group(2)).strip().casefold()
+            for match in heading_ladder
+        ]
+        consecutive_levels = levels == list(range(levels[0], levels[0] + len(levels)))
+        if consecutive_levels and len(set(payloads)) == 1:
+            return True
+
+    blank_signal = bool(re.search(
+        r"\b(?:blank page|page (?:is|appears to be) blank|"
+        r"(?:completely|entirely|mostly|largely|almost) blank|"
+        r"no visible (?:document )?(?:text|content)|nothing to transcribe|"
+        r"does not contain (?:any )?(?:visible )?(?:text|content))\b",
+        plain,
+    )) or bool(re.search(
+        r"\b(?:trang trắng|không (?:có|thấy) (?:văn bản|nội dung)|"
+        r"không có gì để (?:chép|phiên âm|chuyển đổi))\b",
+        plain,
+    ))
+    assistant_signal = bool(re.search(
+        r"\b(?:provided|uploaded|given|image|transcrib|markdown|instructions?|"
+        r"provide another|further assistance|hình ảnh|chuyển đổi|cung cấp)\b",
+        plain,
+    ))
+    # Some models produce a much longer explanation, quote the OCR prompt, and
+    # then explicitly announce that they will return an empty response. Check
+    # that high-confidence assistant conclusion before the conservative length
+    # cap used for generic blank-page wording.
+    empty_conclusion = bool(re.search(
+        r"\b(?:i (?:will|shall|must|am going to) (?:return|provide|leave)|"
+        r"as (?:required|instructed))\b.{0,100}\b(?:empty response|"
+        r"nothing to transcribe|response empty)\b|"
+        r"\bi (?:will|shall|must|am going to) (?:return|provide|leave)\b"
+        r".{0,100}\b(?:empty response|nothing to transcribe|response empty)\b",
+        plain,
+    ))
+    if (
+        len(plain) <= 5000
+        and len(plain.split()) <= 500
+        and blank_signal
+        and assistant_signal
+        and empty_conclusion
+    ):
+        return True
+    if len(plain) > 1200 or len(plain.split()) > 120:
+        return False
+    return blank_signal and assistant_signal
+
+
 # Hàm dọn dẹp và chuẩn hóa văn bản Markdown nhận diện từ mô hình Vision
 def clean_markdown(text: str) -> str:
     """
@@ -1332,6 +2045,8 @@ def clean_markdown(text: str) -> str:
     """
     import re
     text = text.strip()
+    if is_blank_ocr_response(text):
+        return ""
     text = re.sub(r"\\+hfill\b\s*", " ", text)
     text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\r?\n?", "", text)
     text = re.sub(r"\r?\n?```\s*$", "", text)
@@ -1658,11 +2373,17 @@ def pdf_page_count(pdf_path: Path) -> int:
 
 
 # Generator render trang PDF thành ảnh PNG theo tiến trình
-def iter_render_pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 150, render_timings: dict[Path, float] | None = None):
+def iter_render_pdf_to_images(
+    pdf_path: Path, output_dir: Path, dpi: int = 150,
+    render_timings: dict[Path, float] | None = None,
+    skip_page_numbers: set[int] | None = None,
+):
     """Render lần lượt từng trang PDF thành ảnh để luồng OCR có thể xử lý song song ngay lập tức."""
     doc = pymupdf.open(pdf_path)
     try:
         for index in range(len(doc)):
+            if skip_page_numbers and index + 1 in skip_page_numbers:
+                continue
             render_started_at = perf_counter()
             page = doc.load_page(index)
             pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
@@ -1680,6 +2401,22 @@ def iter_render_pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 150, 
 def render_pdf_to_images(pdf_path: Path, output_dir: Path, dpi: int = 150) -> list[Path]:
     """Kết xuất toàn bộ trang PDF thành ảnh PNG."""
     return list(iter_render_pdf_to_images(pdf_path, output_dir, dpi=dpi))
+
+
+def structural_blank_page_numbers(pdf_path: Path) -> set[int]:
+    """Return pages proven empty by PDF structure; failures yield no skips."""
+    pages: set[int] = set()
+    try:
+        doc = pymupdf.open(pdf_path)
+        try:
+            for index in range(len(doc)):
+                if is_blank_pdf_page(doc.load_page(index)):
+                    pages.add(index + 1)
+        finally:
+            doc.close()
+    except Exception:
+        return set()
+    return pages
 
 
 # Hàm render trang chứa bảng biểu với độ phân giải (DPI) cao
@@ -1743,6 +2480,7 @@ def ocr_qwen_images(
         return "".join(collected)
 
     parts = []
+    blank_confirmations = []
     for image_number, image_path in enumerate(images, 1):
         if before_request is not None:
             before_request()
@@ -1758,9 +2496,14 @@ def ocr_qwen_images(
             ),
             max_retries=max_retries, log_func=log_func,
         )
-        parts.append(clean_markdown(consume(chunks)))
+        raw = consume(chunks)
+        blank_confirmations.append(is_blank_ocr_response(raw))
+        parts.append(clean_markdown(raw))
 
-    return "\n\n".join(part for part in parts if part.strip())
+    joined = "\n\n".join(part for part in parts if part.strip())
+    if not joined and blank_confirmations and all(blank_confirmations):
+        return BlankOCRResult("")
+    return joined
 
 
 def ocr_coordinate_blocks(
@@ -1795,6 +2538,8 @@ layout blocks and do not move all figures to the end.
         log_func=log_func,
         before_request=before_request,
     )
+    if isinstance(markdown, BlankOCRResult):
+        return markdown
     return apply_page_assets(markdown, page_number, image_paths, typed_blocks=blocks)
 
 
@@ -1837,7 +2582,8 @@ def output_markdown_path(output_dir: Path, pdf_path: Path) -> Path:
 # Hàm chính xử lý OCR cho một tệp PDF đơn lẻ
 def process_single_pdf(
     pdf_path: Path, output_dir: Path, client: Client, model_name: str,
-    workers: int = 1, render_dpi: int = 300,
+    workers: int = 1, render_dpi: int = 300, skip_blank_pages: bool = True,
+    blank_detection_sensitivity: str = "safe",
 ):
     """
     Tiến hành lập trình tự render và nhận diện OCR toàn bộ tệp PDF:
@@ -1849,6 +2595,9 @@ def process_single_pdf(
         raise ValueError("workers must be at least 1")
     if render_dpi < 72:
         raise ValueError("render_dpi must be at least 72")
+    blank_detection_sensitivity = normalize_blank_detection_sensitivity(
+        blank_detection_sensitivity
+    )
     workers = normalize_worker_count(workers, model_name)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_markdown_path(output_dir, pdf_path)
@@ -1860,13 +2609,17 @@ def process_single_pdf(
         temp_dir_path = Path(temp_dir)
         total_pages = pdf_page_count(pdf_path)
         print(f"Pipelining render and OCR for {total_pages} pages (workers={workers})...")
-    print(f"\nProcessing: {pdf_path.name} -> {output_path.name}")
-    document_started_at = perf_counter()
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_dir_path = Path(temp_dir)
-        total_pages = pdf_page_count(pdf_path)
-        print(f"Pipelining render and OCR for {total_pages} pages (workers={workers})...")
+        structural_blank_pages = (
+            structural_blank_page_numbers(pdf_path) if skip_blank_pages else set()
+        )
+        blank_page_numbers = set(structural_blank_pages)
+        uncertain_page_numbers: set[int] = set()
+        signature_only_page_numbers: set[int] = set()
+        page_stats_lock = threading.Lock()
+        for page_num in sorted(structural_blank_pages):
+            print(f"    -> Bỏ qua trang {page_num} (trang trắng; cấu trúc PDF rỗng)")
+        if skip_blank_pages:
+            print(f"Blank-page sensitivity: {blank_detection_sensitivity}.")
         from app.core.formula_ocr import formula_ocr_status
         _, formula_status = formula_ocr_status()
         print(f"Formula OCR status: {formula_status}.")
@@ -1960,6 +2713,7 @@ def process_single_pdf(
 
             # 1. Trích xuất hình ảnh vật lý từ trang PDF
             extracted_img_paths = []
+            discarded_graphics = []
             try:
                 if TEXT_ONLY_OUTPUT:
                     if page_analysis is not None:
@@ -1977,11 +2731,26 @@ def process_single_pdf(
                         client, qwen_model, crop,
                         log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
                     ),
+                    discarded_graphics_sink=discarded_graphics,
                 )
             except StopIteration:
                 pass
             except Exception as img_err:
                 print(f"    -> [Warning] Failed to extract images: {img_err}")
+
+            removable_regions = [
+                bbox for category, confidence, bbox in discarded_graphics
+                if is_confirmed_signature_stamp(category, confidence)
+            ]
+            if removable_regions and is_blank_page_after_masking(
+                img_path, removable_regions, blank_detection_sensitivity,
+            ):
+                cleanup_unreferenced_assets("", extracted_img_paths, output_dir)
+                print(f"    -> Bỏ qua trang {page_num} (chỉ chứa chữ ký/con dấu)")
+                with page_stats_lock:
+                    signature_only_page_numbers.add(page_num)
+                    uncertain_page_numbers.discard(page_num)
+                return page_num, "", None
 
             if page_analysis is not None:
                 ordered_blocks = retain_extracted_image_blocks(
@@ -2071,6 +2840,14 @@ def process_single_pdf(
                 qwen_seconds = perf_counter() - qwen_started_at
                 error = f"Qwen OCR failed: {ollama_err}"
 
+            if not error and isinstance(page_md, BlankOCRResult):
+                cleanup_unreferenced_assets("", extracted_img_paths, output_dir)
+                with page_stats_lock:
+                    blank_page_numbers.add(page_num)
+                    uncertain_page_numbers.discard(page_num)
+                print(f"    -> Bỏ qua trang {page_num} (Qwen xác nhận không có nội dung)")
+                return page_num, "", None
+
             # 2.5. Thay thế placeholder công thức và hình ảnh theo thứ tự đọc
             if extracted_img_paths:
                 print(f"    -> Extracted {len(extracted_img_paths)} images from PDF page {page_num}.")
@@ -2154,6 +2931,7 @@ def process_single_pdf(
         # Gửi tác vụ OCR ngay khi từng trang được render xong
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = []
+            results = [(page_num, "", None) for page_num in sorted(structural_blank_pages)]
             page_image_paths: dict[int, Path] = {}
             review_regions: dict[int, list[BoundingBox]] = {}
             review_graphics: dict[int, list[BoundingBox]] = {}
@@ -2161,10 +2939,34 @@ def process_single_pdf(
             review_block_spans: dict[int, list] = {}
             for index, image_path in enumerate(iter_render_pdf_to_images(
                 pdf_path, temp_dir_path, dpi=render_dpi, render_timings=render_timings,
+                skip_page_numbers=structural_blank_pages,
             )):
-                page_image_paths[index + 1] = image_path
+                match = re.search(r"page_(\d+)", image_path.stem)
+                page_num = int(match.group(1)) if match else index + 1
+                index = page_num - 1
+                page_image_paths[page_num] = image_path
+                state, metrics = classify_page_image(
+                    image_path, blank_detection_sensitivity,
+                )
+                if skip_blank_pages and state == "blank":
+                    print(f"    -> Bỏ qua trang {page_num} (trang trắng)")
+                    results.append((page_num, "", None))
+                    blank_page_numbers.add(page_num)
+                    continue
+                if skip_blank_pages and state == "uncertain":
+                    uncertain_page_numbers.add(page_num)
+                    print(
+                        f"    -> Trang {page_num} không chắc chắn có trắng hay không; giữ để OCR "
+                        f"(light={float(metrics.get('light_ratio', 0.0)):.2%}, "
+                        f"background={float(metrics.get('background_level', 0.0)):.1f}, "
+                        f"adaptive_ink={float(metrics.get('adaptive_ink_ratio', 0.0)):.3%}, "
+                        f"std={float(metrics.get('stddev', 0.0)):.2f}, "
+                        f"components={int(metrics.get('components', -1))}, "
+                        f"rules={int(metrics.get('horizontal_rules', 0))}/"
+                        f"{int(metrics.get('vertical_rules', 0))})"
+                    )
                 futures.append(executor.submit(process_page_worker, (index, image_path)))
-            results = [future.result() for future in futures]
+            results.extend(future.result() for future in futures)
 
         # Sắp xếp lại theo đúng thứ tự số trang ban đầu
         results.sort(key=lambda x: x[0])
@@ -2180,9 +2982,7 @@ def process_single_pdf(
                         regions=review_regions.get(page_num),
                         graphic_regions=review_graphics.get(page_num),
                         block_spans=review_block_spans.get(page_num) or None,
-                        review_document_footer=(
-                            page_num == total_pages and bool(review_graphics.get(page_num))
-                        ),
+                        review_document_footer=False,
                         quality_score=review_quality_scores.get(page_num),
                     )
                 except Exception as review_error:
@@ -2198,9 +2998,17 @@ def process_single_pdf(
             details = "; ".join(f"page {page_num}: {error}" for page_num, error in failures)
             raise RuntimeError(f"OCR failed; existing output was preserved ({details})")
 
-        ocr_contents = [f"<!-- Page {p_num} -->\n\n{p_md}" for p_num, p_md, _ in results]
+        ocr_contents = [
+            f"<!-- Page {p_num} -->\n\n{p_md}"
+            for p_num, p_md, _ in results if p_md and p_md.strip()
+        ]
 
-        final_md = "\n\n".join(ocr_contents) + "\n"
+        # An all-blank document must produce a truly empty file. Building the
+        # trailing newline conditionally also preserves that guarantee if the
+        # optional Markdown finalizer raises and the fallback value is written.
+        final_md = "\n\n".join(ocr_contents)
+        if final_md:
+            final_md += "\n"
         finalization_report = {"spelling_warnings": []}
         try:
             final_md, finalization_report = finalize_markdown(final_md, return_report=True)
@@ -2215,6 +3023,9 @@ def process_single_pdf(
         write_seconds = perf_counter() - write_started_at
         print(f"Saved OCR to {output_path}")
         print(f"Write benchmark: {write_seconds:.3f}s")
+        print(f"Trang trắng đã bỏ: {len(blank_page_numbers)}")
+        print(f"Trang chỉ có chữ ký/con dấu đã bỏ: {len(signature_only_page_numbers)}")
+        print(f"Trang không chắc chắn được giữ để OCR: {len(uncertain_page_numbers)}")
         document_elapsed = perf_counter() - document_started_at
         average = document_elapsed / total_pages if total_pages else 0.0
         print(f"Performance: workers={workers}, total={document_elapsed:.2f}s, average={average:.2f}s/page")
@@ -2231,6 +3042,18 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Path to output directory")
     parser.add_argument("--workers", type=int, choices=(1, 2), default=1, help="Concurrent OCR requests; benchmark 1 vs 2 on your GPU (default: 1)")
     parser.add_argument("--dpi", type=int, choices=(200, 250, 300), default=300, help="PDF render DPI (default: 300)")
+    parser.add_argument(
+        "--keep-blank-pages", action="store_false", dest="skip_blank_pages",
+        help="Send blank pages through OCR instead of skipping them",
+    )
+    parser.add_argument(
+        "--blank-sensitivity", choices=BLANK_DETECTION_SENSITIVITIES,
+        default="safe",
+        help=(
+            "Blank-page detection sensitivity: safe (default), standard, "
+            "or aggressive"
+        ),
+    )
     args = parser.parse_args()
 
     input_path = args.input if args.input else "PDF"
@@ -2271,6 +3094,8 @@ def main():
         process_single_pdf(
             pdf_file, ocr_dir, client, args.model,
             workers=args.workers, render_dpi=args.dpi,
+            skip_blank_pages=args.skip_blank_pages,
+            blank_detection_sensitivity=args.blank_sensitivity,
         )
 
     total_elapsed = perf_counter() - total_start
