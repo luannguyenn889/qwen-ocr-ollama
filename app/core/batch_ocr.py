@@ -43,7 +43,7 @@ import pymupdf  # PyMuPDF
 # pyrefly: ignore [missing-import]
 from ollama import Client
 # pyrefly: ignore [missing-import]
-from PIL import Image, ImageStat
+from PIL import Image, ImageStat, ImageEnhance, ImageFilter
 from io import BytesIO
 
 MODEL = "qwen3.5:4b"
@@ -73,8 +73,8 @@ TEXT_ONLY_OUTPUT = False
 # requiring 0.98 caused verified stamps in faint scans to be emitted as images.
 SIGNATURE_STAMP_CONFIDENCE = 0.90
 
-# DPI độ phân giải cao hơn dành riêng cho các trang có bảng biểu được nhận diện
-TABLE_RENDER_DPI = 300
+# DPI độ phân giải cao hơn dành riêng cho các trang có bảng biểu được nhận diện (Super-Resolution)
+TABLE_RENDER_DPI = 400
 
 # One canonical target pattern shared by linking, page cleanup and finalization.
 IMAGE_PLACEHOLDER_TARGET_RE = r"(?:[^\s)'\"]*/)?image_placeholder(?:\.[A-Za-z0-9]+)?"
@@ -147,6 +147,7 @@ def normalize_blank_detection_sensitivity(value: str | None) -> str:
 
 def _edge_border_depth(values, background: float, maximum: int, occupancy: float) -> int:
     """Measure a continuous dark scanner band beginning at one image edge."""
+    # pyrefly: ignore [missing-import]
     import numpy as np
 
     if maximum <= 0 or values.size == 0:
@@ -172,6 +173,7 @@ def _edge_border_depth(values, background: float, maximum: int, occupancy: float
 
 def _crop_scanner_borders(gray_pixels, profile: dict[str, float | int]):
     """Crop fixed safety margins plus any continuous dark scanner border."""
+    # pyrefly: ignore [missing-import]
     import numpy as np
 
     height, width = gray_pixels.shape
@@ -199,13 +201,16 @@ def _crop_scanner_borders(gray_pixels, profile: dict[str, float | int]):
 
 def _remove_edge_artifacts(ink, profile: dict[str, float | int]):
     """Remove border remnants, binding marks and punch holes from an ink mask."""
+    # pyrefly: ignore [missing-import]
     import cv2
+    # pyrefly: ignore [missing-import]
     import numpy as np
 
     cleaned = ink.copy()
     height, width = cleaned.shape
     total = max(height * width, 1)
     edge_x = max(2, int(width * float(profile["edge_band"])))
+    # pyrefly: ignore [missing-import]
     edge_y = max(2, int(height * float(profile["edge_band"])))
     count, labels, stats, _centroids = cv2.connectedComponentsWithStats(cleaned, 8)
     broad_scan_fold_count = sum(
@@ -266,7 +271,9 @@ def _remove_edge_artifacts(ink, profile: dict[str, float | int]):
 
 def _remove_repeated_rule_lines(ink, profile: dict[str, float | int]):
     """Remove repeated long lines characteristic of lined or grid paper."""
+    # pyrefly: ignore [missing-import]
     import cv2
+    # pyrefly: ignore [missing-import]
     import numpy as np
 
     height, width = ink.shape
@@ -350,7 +357,9 @@ def _classify_blank_image(
         "rule_line_ratio": 0.0,
     }
     try:
+        # pyrefly: ignore [missing-import]
         import cv2
+        # pyrefly: ignore [missing-import]
         import numpy as np
 
         gray_pixels = np.asarray(gray)
@@ -490,6 +499,7 @@ def is_blank_page_after_masking(
     try:
         with Image.open(image_path) as source:
             masked = source.convert("RGB")
+            # pyrefly: ignore [missing-import]
             from PIL import ImageDraw
             draw = ImageDraw.Draw(masked)
             for left, top, right, bottom in normalized_regions:
@@ -516,8 +526,8 @@ def find_isolated_chromatic_graphics(
     if max_regions < 1:
         return []
     try:
-        import cv2
-        import numpy as np
+        import cv2  # pyrefly: ignore [missing-import]
+        import numpy as np  # pyrefly: ignore [missing-import]
 
         with Image.open(image_path) as source:
             image = source.convert("RGB")
@@ -735,9 +745,12 @@ Follow these strict structural and formatting guidelines:
    - Ensure every formula has its own closed pair of dollar signs. Do not merge separate items, punctuation, or non-math labels inside the same dollar sign block.
 
 3. Tables & Figures:
-   - Convert simple tables into standard Markdown tables.
-   - For complex tables (with merged rows/columns or nested cells), format them using clean HTML `<table>` tags.
-   - If a table continues from the previous page, preserve its column structure and do not invent a new header. Keep image placeholders outside table markup.
+   - Convert simple tables into standard Markdown pipe tables (`| Col 1 | Col 2 |`).
+   - For complex tables (with merged rows/columns, rowspans, colspans, or nested cells), format them using clean HTML `<table>` tags (`<tr>`, `<th>`, `<td>`, `rowspan`, `colspan`).
+   - Strict rule for Markdown tables:
+     * Flatten multi-level headers into a single header row (e.g., combine parent and sub-headers: "Kết quả thống kê - Đơn vị tính | Kết quả thống kê - Số liệu").
+     * Strict column count consistency: Every row in a Markdown table (header, separator `:---`, and all data rows) MUST contain the EXACT SAME number of columns (N columns). Never emit rows with missing or mismatched column counts.
+   - If a table continues from the previous page, preserve its exact column structure and do not invent new headers. Keep image placeholders outside table markup.
    - Use `image_placeholder` only for genuine photographs, charts, logos, or primarily graphical illustrations.
    - Text boxes, callouts, framed notes, forms, and flowchart/diagram nodes containing text MUST be transcribed completely as Markdown (use blockquotes, lists, or tables where appropriate). Never replace their readable text with an image placeholder.
    - For a genuine figure that also contains readable labels, emit one image tag and transcribe its important visible text immediately below the tag.
@@ -754,8 +767,19 @@ Follow these strict structural and formatting guidelines:
      confirmation block. Do not add an evidence note such as `[Signed and stamped]`
      unless a separate instruction explicitly requests it.
 
-4. General Rules:
+4. Checkboxes, Handwriting, Choices & Markings:
+   - Form Checkboxes: Transcribe unchecked square boxes as `- [ ]` (or `[ ]`) and checked/ticked/filled boxes (marked with ✓, ✗, x, or filled) as `- [x]` (or `[x]`).
+   - Circled / Selected Answers: When a multiple-choice letter (A., B., C., D. or A, B, C, D) is circled or enclosed by a hand-drawn circle/marking, transcribe it as **(A)** (bold with parentheses) to distinguish the chosen answer from unselected choices.
+   - Handwritten Strikethrough & Edits: When printed text has a visible pen line crossing it out, wrap the struck text in Markdown strikethrough: `~~deleted text~~`.
+   - Handwritten Form Filling: Faithfully transcribe handwritten text filled into blanks or form fields at its exact corresponding position.
+
+5. General Rules, Symbols & Vietnamese Diacritics:
    - Keep the original text exactly as written, preserving the language (Vietnamese, English, etc.) and spelling.
+   - Preserve special symbols, units, and typography faithfully (e.g., degree `°C`, dimensions `×`, micro `µ`, plus-minus `±`, comparisons `≤`, `≥`, `≈`, copyright `©`, `®`, `™`, superscripts/subscripts `m²`, `m³`, `x₁`).
+   - Strict Vietnamese Diacritic & Glyph Precision:
+     * Pay extreme attention to Vietnamese diacritics: distinguish accurately between dot below / dấu nặng (.) and acute / dấu sắc ('), hook above / dấu hỏi (?) and tilde / dấu ngã (~), circumflex / dấu mũ (â, ê, ô) and horn / dấu móc (ơ, ư), and 'đ' vs 'd'.
+     * Distinguish accurately between 'n' and 'm', 'c' and 'o', 't' and 'l' at word boundaries and endings (e.g., 'giản' vs 'giảm', 'kiện' vs 'kiến', 'có' vs 'cơ').
+     * Read strictly and faithfully according to the visible image pixels; never infer, complete, or replace words based on conversational assumptions.
    - Inspect stylized/display fonts character by character, especially Vietnamese diacritics and easily confused letters. Use surrounding context only to choose among glyphs that are actually visible, never to invent text.
    - Do not summarize, explain, or add any introductory/concluding text.
    - Return only the raw Markdown content. Do not wrap the final output in ```markdown blocks.
@@ -764,12 +788,10 @@ Follow these strict structural and formatting guidelines:
 
 # Chỉ lệnh bắt buộc đối với trang chứa bảng biểu
 TABLE_SAFE_INSTRUCTION = """
-
-
 LƯU Ý BẮT BUỘC VỀ BẢNG: Trang này có bảng biểu. Đọc toàn bộ ảnh trang, không đọc theo cột bị cắt.
-MỌI bảng trên trang này bắt buộc dùng HTML `<table>` với `<tr>`, `<th>`, `<td>`, `rowspan` và `colspan`
-khi cần. TUYỆT ĐỐI không dùng bảng Markdown bằng ký tự `|`. Không biến nội dung các ô thành bullet lồng
-nhau, không lặp tiêu chí giữa các hàng, không tự suy diễn hoặc hoàn thiện chữ không nhìn rõ.
+- Với bảng phức tạp (có gộp dòng/gộp cột, rowspan, colspan): BẮT BUỘC dùng HTML `<table>` với `<tr>`, `<th>`, `<td>`, `rowspan` và `colspan`.
+- Nếu dùng bảng Markdown: BẮT BUỘC làm phẳng header thành đúng 1 dòng (N cột bằng nhau cho mọi hàng) và đồng nhất số cột từ đầu đến cuối.
+- TUYỆT ĐỐI không biến nội dung các ô thành bullet lồng nhau, không lặp tiêu chí giữa các hàng, không tự suy diễn hoặc hoàn thiện chữ không nhìn rõ.
 """.strip()
 
 # Hướng dẫn phục hồi cấu trúc bảng HTML trong trường hợp thử lại
@@ -962,19 +984,61 @@ def _prepare_graphic_classification_image(crop_path: Path, max_edge: int) -> Pat
     return target
 
 
+def _is_monochrome_document_grid(crop_image) -> bool:
+    """Detect if a cropped region is an unambiguous black-and-white document table grid."""
+    try:
+        # pyrefly: ignore [missing-import]
+        import numpy as np
+        rgb = np.asarray(crop_image.convert("RGB"))
+        if rgb.ndim != 3 or rgb.shape[0] < 50 or rgb.shape[1] < 50:
+            return False
+
+        # 1. Color check: Plain document tables on white paper have near-zero color saturation
+        channel_diff_mean = np.mean(
+            np.abs(rgb[:, :, 0].astype(float) - rgb[:, :, 1].astype(float)) +
+            np.abs(rgb[:, :, 1].astype(float) - rgb[:, :, 2].astype(float))
+        )
+        if channel_diff_mean > 12.0:
+            return False
+
+        # 2. Paper background check: At least 65% of the image must be white paper
+        gray = rgb[:, :, 0]
+        white_ratio = np.mean(gray > 200)
+        if white_ratio < 0.65:
+            return False
+
+        # 3. Grid line check with OpenCV
+        # pyrefly: ignore [missing-import]
+        import cv2
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        h, w = gray.shape
+        h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(30, int(w * 0.40)), 1))
+        h_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, h_kernel)
+        h_count = cv2.connectedComponents(h_lines)[0] - 1
+
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, int(h * 0.30))))
+        v_lines = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, v_kernel)
+        v_count = cv2.connectedComponents(v_lines)[0] - 1
+
+        # Must have at least 4 clear horizontal grid lines and 2 vertical column lines
+        return h_count >= 4 and v_count >= 2
+    except Exception:
+        return False
+
+
 def classify_graphic_crop(client, model: str, crop_path: Path, *, before_request=None, log_func=print):
     """Classify graphics without asking the model to transcribe their contents."""
     if before_request is not None:
         before_request()
     prompt = """Phân loại thành phần đồ họa trong ảnh crop; không OCR và không chép bất kỳ chữ nào.
-Chọn đúng một category: content_image, logo, signature, stamp, text_fragment, decoration, page_canvas, uncertain.
-content_image gồm ảnh chụp, biểu đồ, sơ đồ hoặc hình minh họa.
+Chọn đúng một category: content_image, logo, signature, stamp, text_fragment, table, decoration, page_canvas, uncertain.
+content_image chỉ gồm ảnh chụp thật, tranh vẽ, biểu đồ thống kê (chart) hoặc sơ đồ khối minh họa độc lập.
+table gồm bảng biểu, bảng tính, lưới ô kẻ chứa dữ liệu hoặc biểu mẫu số liệu (KHÔNG phải content_image).
 logo gồm biểu trưng cơ quan/thương hiệu, huy hiệu, logo tròn hoặc logo có chữ được thiết kế sạch.
 stamp chỉ là dấu mực thực sự đóng lên tài liệu, thường có nét mực không đều, chồng lên chữ/nền giấy.
-text_fragment là mảnh chữ, đường kẻ hoặc một phần textbox bị cắt rời, không phải hình minh họa độc lập.
+text_fragment là bảng biểu, mảnh chữ, đường kẻ hoặc một phần textbox bị cắt rời, không phải hình minh họa độc lập.
 page_canvas là ảnh nền hoặc ảnh gần như chứa toàn bộ trang, làm lặp nội dung OCR của trang.
-Không được chọn stamp chỉ vì logo có hình tròn hoặc tên cơ quan. Nếu không phân biệt chắc logo và con dấu,
-phải chọn logo hoặc uncertain; chỉ chọn signature/stamp khi hình ảnh chứng minh rõ.
+Không được chọn content_image nếu ảnh chứa bảng số liệu, danh sách dòng kẻ, văn bản hoặc biểu mẫu tài liệu.
 Chỉ trả JSON: {"category":"...","confidence":0.0}"""
     temporary_images: list[Path] = []
 
@@ -984,7 +1048,7 @@ Chỉ trả JSON: {"category":"...","confidence":0.0}"""
                 model=model, prompt=prompt, images=[str(image_path)], think=False,
                 stream=False, format="json",
                 options={"temperature": 0, "num_ctx": 8192, "num_predict": 128},
-                keep_alive="10m",
+                keep_alive="30m",
             ), log_func=log_func,
         )
 
@@ -1014,7 +1078,7 @@ Chỉ trả JSON: {"category":"...","confidence":0.0}"""
         for temporary_image in temporary_images:
             temporary_image.unlink(missing_ok=True)
     allowed = {
-        "content_image", "logo", "signature", "stamp", "text_fragment",
+        "content_image", "logo", "signature", "stamp", "text_fragment", "table",
         "decoration", "page_canvas", "uncertain",
     }
     return (category if category in allowed else "uncertain"), confidence
@@ -1030,7 +1094,9 @@ def is_confirmed_signature_stamp(category: str, confidence: float) -> bool:
 def _discard_classified_graphic(category: str, confidence: float) -> bool:
     return (
         is_confirmed_signature_stamp(category, confidence)
-    ) or (category in {"text_fragment", "decoration", "page_canvas"} and confidence >= 0.95)
+    ) or (category == "table" and confidence >= 0.80) or (
+        category in {"text_fragment", "decoration", "page_canvas"} and confidence >= 0.95
+    )
 
 
 def remove_signature_stamp_links(markdown: str) -> str:
@@ -1151,7 +1217,11 @@ def extract_images_from_page(
                         )
 
                         crop_path = output_img_dir / f"{prefix}_page_{page_index + 1}_layout_img_{img_idx}.png"
-                        image.crop((left, top, right, bottom)).save(crop_path)
+                        cropped_image = image.crop((left, top, right, bottom))
+                        if _is_monochrome_document_grid(cropped_image):
+                            print(f"    -> Kept monochrome document table grid {img_idx} for OCR instead of cropping it as an image.")
+                            continue
+                        cropped_image.save(crop_path)
                         if _needs_graphic_classification(page, pdf_rect) and graphic_classifier is not None:
                             category, confidence = graphic_classifier(crop_path)
                             if _discard_classified_graphic(category, confidence):
@@ -1395,6 +1465,35 @@ def extract_images_from_page(
     return [path for path, _ in extracted_items]
 
 
+def _clean_html_table_intermediate_headers(markdown_text: str) -> str:
+    """Xóa các hàng header lặp lại hoặc hàng <tr> chỉ chứa <th> xuất hiện ở giữa thân bảng HTML."""
+    th_only_tr_re = re.compile(
+        r"^\s*<tr>\s*(?:<th\b[^>]*>.*?</th>\s*)+</tr>\s*",
+        re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
+    thead_re = re.compile(
+        r"^\s*<thead>.*?</thead>\s*",
+        re.IGNORECASE | re.DOTALL | re.MULTILINE,
+    )
+
+    def clean_table(match: re.Match[str]) -> str:
+        table_html = match.group(0)
+        first_td_match = re.search(r"<td\b", table_html, re.IGNORECASE)
+        if not first_td_match:
+            return table_html
+
+        first_td_pos = first_td_match.start()
+        header_part = table_html[:first_td_pos]
+        body_part = table_html[first_td_pos:]
+
+        body_part = thead_re.sub("", body_part)
+        body_part = th_only_tr_re.sub("", body_part)
+        return header_part + body_part
+
+    table_re = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
+    return table_re.sub(clean_table, markdown_text)
+
+
 # Hàm gộp các khối bảng Markdown bị phân mảnh thành một bảng thống nhất
 def merge_markdown_tables(markdown_text: str) -> str:
     # Vision models occasionally wrap one page fragment in a complete HTML
@@ -1405,11 +1504,13 @@ def merge_markdown_tables(markdown_text: str) -> str:
         markdown_text,
         flags=re.IGNORECASE,
     )
-    def sequence_rank(value: str) -> tuple[str, int] | None:
+    markdown_text = _clean_html_table_intermediate_headers(markdown_text)
+
+    def sequence_rank(value: str) -> tuple[str, tuple[int, ...] | int] | None:
         """Parse a generic row-order key without assuming a document schema."""
         token = re.sub(r"<[^>]+>|[*_`]", "", value).strip().rstrip(".)-:")
-        if re.fullmatch(r"\d+", token):
-            return "number", int(token)
+        if re.fullmatch(r"\d+(?:\.\d+)*", token):
+            return "hierarchical_number", tuple(int(x) for x in token.split("."))
         if re.fullmatch(r"[A-Za-z]", token):
             return "letter", ord(token.casefold())
         if len(token) > 1 and re.fullmatch(r"[IVXLCDM]+", token, re.I):
@@ -1421,6 +1522,28 @@ def merge_markdown_tables(markdown_text: str) -> str:
                 previous = max(previous, current)
             return "roman", total
         return None
+
+    def is_sequential_continuation(prev_rank, curr_rank) -> bool:
+        if prev_rank is None or curr_rank is None:
+            return False
+        if prev_rank[0] != curr_rank[0]:
+            return False
+        if prev_rank[0] == "hierarchical_number":
+            p_parts: tuple[int, ...] = prev_rank[1]
+            c_parts: tuple[int, ...] = curr_rank[1]
+            if len(p_parts) == len(c_parts):
+                return p_parts[:-1] == c_parts[:-1] and c_parts[-1] == p_parts[-1] + 1
+            if len(c_parts) == len(p_parts) + 1:
+                return c_parts[:-1] == p_parts and c_parts[-1] == 1
+            if len(c_parts) < len(p_parts):
+                prefix_len = len(c_parts) - 1
+                return (
+                    p_parts[:prefix_len] == c_parts[:prefix_len]
+                    and c_parts[-1] == p_parts[prefix_len] + 1
+                )
+        elif prev_rank[0] in ("letter", "roman"):
+            return curr_rank[1] == prev_rank[1] + 1
+        return False
 
     def trim_empty_trailing_columns(rows: list[str]) -> list[str]:
         """Drop only columns that are empty in every non-separator row."""
@@ -1476,9 +1599,23 @@ def merge_markdown_tables(markdown_text: str) -> str:
                 continue
             first = left.group(0)
             second = right.group(0)
+            second_inner = second[second.find(">") + 1 : second.lower().rfind("</table>")]
+
+            # Remove all repeated thead or repeated header rows with only <th> tags from continuation table
+            while True:
+                thead_match = re.match(r"^\s*<thead>.*?</thead>", second_inner, flags=re.IGNORECASE | re.DOTALL)
+                if thead_match:
+                    second_inner = second_inner[thead_match.end():]
+                    continue
+                th_row_match = re.match(r"^\s*<tr>\s*(?:<th\b[^>]*>.*?</th>\s*)+</tr>", second_inner, flags=re.IGNORECASE | re.DOTALL)
+                if th_row_match:
+                    second_inner = second_inner[th_row_match.end():]
+                    continue
+                break
+
             combined = (
                 first[: first.lower().rfind("</table>")]
-                + second[second.find(">") + 1 : second.lower().rfind("</table>")]
+                + second_inner
                 + "</table>"
                 + bridge
             )
@@ -1586,12 +1723,20 @@ def merge_markdown_tables(markdown_text: str) -> str:
                 ):
                     block["rows"] = pad_rows(block["rows"], last_columns)
                     current_columns = last_columns
+                elif last_columns != current_columns and abs(last_columns - current_columns) <= 2:
+                    max_cols = max(last_columns, current_columns)
+                    last["rows"] = pad_rows(last["rows"], max_cols)
+                    block["rows"] = pad_rows(block["rows"], max_cols)
+                    last_columns = current_columns = max_cols
+
                 header_last = [c.strip().casefold() for c in _split_markdown_table_row(last["rows"][0])]
                 header_curr = [c.strip().casefold() for c in _split_markdown_table_row(block["rows"][0])]
                 same_header = block["has_header"] and header_last == header_curr
                 continuation = not block["has_header"] and last_columns == current_columns
 
                 is_pseudo_header = False
+                continuation_by_seq = False
+                start_data_idx = 2
                 if block["has_header"] and last_columns == current_columns and not same_header:
                     first_cell_curr = header_curr[0].strip() if header_curr else ""
                     first_cell_last_hdr = header_last[0].strip() if header_last else ""
@@ -1601,20 +1746,29 @@ def merge_markdown_tables(markdown_text: str) -> str:
                     header_rank = sequence_rank(first_cell_last_hdr)
                     previous_rank = sequence_rank(last_order_cell)
 
-                    if current_rank is not None and header_rank is None:
+                    if current_rank is not None and header_rank is None and previous_rank is None:
                         is_pseudo_header = True
-                    elif (
-                        current_rank is not None and previous_rank is not None
-                        and current_rank[0] == previous_rank[0]
-                        and current_rank[1] == previous_rank[1] + 1
-                    ):
+                    elif is_sequential_continuation(previous_rank, current_rank):
                         is_pseudo_header = True
+                    else:
+                        first_data_rank = None
+                        for r_idx, r in enumerate(block["rows"][2:], start=2):
+                            cells = _split_markdown_table_row(r)
+                            if cells and cells[0].strip():
+                                first_data_rank = sequence_rank(cells[0].strip())
+                                if first_data_rank is not None:
+                                    start_data_idx = r_idx
+                                    break
+                        if first_data_rank is not None and is_sequential_continuation(previous_rank, first_data_rank):
+                            continuation_by_seq = True
 
-                if same_header or continuation or is_pseudo_header:
+                if same_header or continuation or is_pseudo_header or continuation_by_seq:
                     if same_header:
                         data_rows = block["rows"][2:]
                     elif is_pseudo_header:
                         data_rows = [block["rows"][0]] + block["rows"][2:]
+                    elif continuation_by_seq:
+                        data_rows = block["rows"][start_data_idx:]
                     else:
                         data_rows = block["rows"]
                     last["rows"].extend(data_rows)
@@ -1970,17 +2124,16 @@ def is_blank_ocr_response(text: str) -> bool:
     plain = re.sub(r"\s+", " ", plain).strip().casefold()
     if not plain:
         return True
-    # Some Ollama/Qwen builds materialize an otherwise empty generation as a
-    # short UI-style placeholder. It is an assistant status, never page text,
-    # but only discard it when it is the complete response.
+
+    # 1. Direct short assistant placeholders
     placeholder = plain.strip("()[]{} .:-")
-    if placeholder in {"empty response", "no response", "no content"}:
+    if placeholder in {
+        "empty response", "no response", "no content", "n/a", "none", "blank", "blank page",
+        "empty", "null", "nothing", "no visible text", "không có nội dung", "trang trắng",
+    }:
         return True
-    # A blank/near-blank image can make a vision model emit the same invented
-    # token as an ascending Markdown heading ladder (# value, ## value, ...).
-    # Treat it as a generation-status failure only when it is the *entire*
-    # response, has at least four consecutive heading levels, and every
-    # reader-visible payload is identical.
+
+    # 2. Heading ladders
     nonblank_lines = [line.strip() for line in candidate.splitlines() if line.strip()]
     heading_ladder = [
         re.fullmatch(r"(#{1,6})\s+(.+?)\s*", line)
@@ -1996,45 +2149,55 @@ def is_blank_ocr_response(text: str) -> bool:
         if consecutive_levels and len(set(payloads)) == 1:
             return True
 
-    blank_signal = bool(re.search(
-        r"\b(?:blank page|page (?:is|appears to be) blank|"
-        r"(?:completely|entirely|mostly|largely|almost) blank|"
-        r"no visible (?:document )?(?:text|content)|nothing to transcribe|"
-        r"does not contain (?:any )?(?:visible )?(?:text|content))\b",
-        plain,
-    )) or bool(re.search(
-        r"\b(?:trang trắng|không (?:có|thấy) (?:văn bản|nội dung)|"
-        r"không có gì để (?:chép|phiên âm|chuyển đổi))\b",
-        plain,
-    ))
-    assistant_signal = bool(re.search(
-        r"\b(?:provided|uploaded|given|image|transcrib|markdown|instructions?|"
-        r"provide another|further assistance|hình ảnh|chuyển đổi|cung cấp)\b",
-        plain,
-    ))
-    # Some models produce a much longer explanation, quote the OCR prompt, and
-    # then explicitly announce that they will return an empty response. Check
-    # that high-confidence assistant conclusion before the conservative length
-    # cap used for generic blank-page wording.
-    empty_conclusion = bool(re.search(
-        r"\b(?:i (?:will|shall|must|am going to) (?:return|provide|leave)|"
-        r"as (?:required|instructed))\b.{0,100}\b(?:empty response|"
-        r"nothing to transcribe|response empty)\b|"
-        r"\bi (?:will|shall|must|am going to) (?:return|provide|leave)\b"
-        r".{0,100}\b(?:empty response|nothing to transcribe|response empty)\b",
-        plain,
-    ))
-    if (
-        len(plain) <= 5000
-        and len(plain.split()) <= 500
-        and blank_signal
-        and assistant_signal
-        and empty_conclusion
-    ):
+    # 3. Prompt rule leakage / quotation
+    prompt_leakage_signals = [
+        "transcribe only text that is visibly present",
+        "if the page contains no visible document content",
+        "do not describe the blank page",
+        "never answer questions, solve exercises",
+        "infer an answer key, summarize, explain",
+        "absolute priority rule",
+        "strict ocr-only rules",
+        "ocr-only rules",
+        "transcribe only text",
+        "no visible document content, return an empty response",
+    ]
+    if any(sig in plain for sig in prompt_leakage_signals):
         return True
-    if len(plain) > 1200 or len(plain.split()) > 120:
-        return False
-    return blank_signal and assistant_signal
+
+    # 4. Assistant descriptions of blank / illegible / unreadable pages
+    blank_signals = [
+        r"\b(?:blank page|page (?:is|appears to be|seems to be) blank|"
+        r"(?:completely|entirely|mostly|largely|almost|essentially) blank|"
+        r"no visible (?:document )?(?:text|content)|nothing to transcribe|"
+        r"does not contain (?:any )?(?:visible )?(?:text|content)|"
+        r"no readable (?:words|text|content)|"
+        r"too indistinct to be transcribed|illegible or reversed text|"
+        r"cannot be transcribed accurately)\b",
+        r"\b(?:trang trắng|không (?:có|thấy) (?:văn bản|nội dung|chữ)|"
+        r"không có gì để (?:chép|phiên âm|chuyển đổi)|không thể nhận diện)\b",
+    ]
+    has_blank_signal = any(bool(re.search(pat, plain)) for pat in blank_signals)
+
+    assistant_signals = [
+        r"\b(?:provided|uploaded|given|scanned document page|image|transcrib|markdown|instructions?|"
+        r"according to|per (?:your|the)|rule|priority|empty response|"
+        r"provide another|further assistance|hình ảnh|chuyển đổi|cung cấp)\b"
+    ]
+    has_assistant_signal = any(bool(re.search(pat, plain)) for pat in assistant_signals)
+
+    if has_blank_signal and has_assistant_signal:
+        return True
+
+    # 5. Generic assistant refusal / inability to transcribe
+    refusal_patterns = [
+        r"^(?:as an ai|i (?:cannot|can't|am unable to) (?:read|transcribe|process|see)|there is no (?:text|content) in (?:this|the) image)",
+        r"\b(?:empty response|no content to transcribe)\b\.?\s*$",
+    ]
+    if any(bool(re.search(pat, plain)) for pat in refusal_patterns):
+        return True
+
+    return False
 
 
 # Hàm dọn dẹp và chuẩn hóa văn bản Markdown nhận diện từ mô hình Vision
@@ -2052,12 +2215,19 @@ def clean_markdown(text: str) -> str:
     text = re.sub(r"\r?\n?```\s*$", "", text)
     text = text.strip()
 
-    # Loại bỏ các đoạn chào hỏi tự động của chatbot ở đầu văn bản
+    # Loại bỏ các đoạn chào hỏi / mở đầu tự động của chatbot ở đầu văn bản
     text = re.sub(
-        r"\A(?:based on (?:your|the) requirements|here (?:is|are) (?:the )?(?:converted|extracted|requested)|dưới đây là).+?(?:\r?\n){2,}",
+        r"\A\s*(?:(?:Here (?:is|are)|Below is|Dưới đây là|Certainly|Sure|Based on (?:your|the) requirements)[^\n]*?(?:OCR|transcription|extracted|requested|chuyển đổi|văn bản)?[^\n]*?:\s*\n+)+",
         "",
         text,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
+    )
+    # Loại bỏ các đoạn kết luận / lời chào thừa ở cuối văn bản
+    text = re.sub(
+        r"\n+\s*(?:I hope this (?:helps|is helpful)|Let me know if you (?:need|have)|End of transcription|Đó là toàn bộ nội dung)[^\n]*\Z",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
 
     # Loại bỏ thực thể khoảng trắng HTML
@@ -2182,46 +2352,96 @@ def post_process_markdown(text: str) -> str:
 
 from html.parser import HTMLParser
 
-class _SimpleHTMLTableParser(HTMLParser):
+class _GridHTMLTableParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.rows: list[list[str]] = []
-        self.current_row: list[str] = []
+        self.rows_raw: list[list[tuple[str, int, int, bool]]] = []
+        self.current_row: list[tuple[str, int, int, bool]] = []
         self.current_cell: list[str] = []
+        self.current_rowspan = 1
+        self.current_colspan = 1
+        self.current_is_th = False
         self.has_complex_span = False
         self.in_cell = False
 
     def handle_starttag(self, tag: str, attrs) -> None:
         attrs_map = dict(attrs)
-        if tag == "tr":
+        tag_lower = tag.lower()
+        if tag_lower == "tr":
             self.current_row = []
-        elif tag in {"td", "th"}:
+        elif tag_lower in {"td", "th"}:
             self.in_cell = True
             self.current_cell = []
-            colspan = attrs_map.get("colspan")
-            rowspan = attrs_map.get("rowspan")
-            if (colspan and colspan != "1") or (rowspan and rowspan != "1"):
+            self.current_is_th = (tag_lower == "th")
+            try:
+                self.current_colspan = max(1, int(attrs_map.get("colspan", 1)))
+            except (ValueError, TypeError):
+                self.current_colspan = 1
+            try:
+                self.current_rowspan = max(1, int(attrs_map.get("rowspan", 1)))
+            except (ValueError, TypeError):
+                self.current_rowspan = 1
+            if self.current_colspan > 1 or self.current_rowspan > 1:
                 self.has_complex_span = True
-        elif tag == "br" and self.in_cell:
+        elif tag_lower == "br" and self.in_cell:
             self.current_cell.append("<br>")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag in {"td", "th"}:
+        tag_lower = tag.lower()
+        if tag_lower in {"td", "th"}:
             self.in_cell = False
             cell_text = "".join(self.current_cell).strip()
             cell_text = re.sub(r"\r?\n+", "<br>", cell_text)
-            self.current_row.append(cell_text)
-        elif tag == "tr":
+            self.current_row.append((cell_text, self.current_rowspan, self.current_colspan, self.current_is_th))
+        elif tag_lower == "tr":
             if self.current_row:
-                self.rows.append(self.current_row)
+                self.rows_raw.append(self.current_row)
 
     def handle_data(self, data: str) -> None:
         if self.in_cell:
             self.current_cell.append(data)
 
+    def to_grid(self) -> list[list[str]]:
+        if not self.rows_raw:
+            return []
+        grid: list[dict[int, str]] = [{} for _ in range(len(self.rows_raw))]
+        for r_idx, row in enumerate(self.rows_raw):
+            c_idx = 0
+            for cell_text, r_span, c_span, _ in row:
+                while c_idx in grid[r_idx]:
+                    c_idx += 1
+                for dr in range(r_span):
+                    target_r = r_idx + dr
+                    while len(grid) <= target_r:
+                        grid.append({})
+                    for dc in range(c_span):
+                        target_c = c_idx + dc
+                        grid[target_r][target_c] = cell_text if (dr == 0 and dc == 0) else ""
+                c_idx += c_span
+
+        max_cols = max((max(r.keys()) + 1 for r in grid if r), default=0)
+        if max_cols == 0:
+            return []
+
+        result = []
+        for r in grid:
+            if not r:
+                continue
+            row_list = [r.get(c, "") for c in range(max_cols)]
+            if any(cell.strip() for cell in row_list):
+                result.append(row_list)
+        return result
+
+    @property
+    def rows(self) -> list[list[str]]:
+        return self.to_grid()
+
+
+_SimpleHTMLTableParser = _GridHTMLTableParser
+
 
 def convert_simple_html_tables_to_markdown(markdown: str) -> tuple[str, int]:
-    """Tự động chuyển đổi các bảng HTML đơn giản thành bảng Markdown pipe table (|)."""
+    """Tự động chuyển đổi các bảng HTML thành bảng Markdown pipe table (|)."""
     table_re = re.compile(r"<table\b[^>]*>.*?</table>", re.IGNORECASE | re.DOTALL)
     converted_count = 0
 
@@ -2232,40 +2452,67 @@ def convert_simple_html_tables_to_markdown(markdown: str) -> tuple[str, int]:
         if len(re.findall(r"<table\b", html_code, re.IGNORECASE)) > 1:
             return html_code
 
-        parser = _SimpleHTMLTableParser()
+        parser = _GridHTMLTableParser()
         try:
             parser.feed(html_code)
         except Exception:
             return html_code
 
-        if parser.has_complex_span or not parser.rows or len(parser.rows) < 2:
+        if parser.has_complex_span or not parser.rows_raw or len(parser.rows_raw) < 2:
             return html_code
 
-        col_counts = [len(r) for r in parser.rows]
+        col_counts = [len(r) for r in parser.rows_raw]
         if not col_counts:
             return html_code
 
         num_cols = max(col_counts)
         if num_cols < 2:
             return html_code
-        if len(parser.rows[0]) != num_cols:
+        if len(parser.rows_raw[0]) != num_cols:
             # A data row wider than the declared header is structurally
             # ambiguous; leave it as repaired HTML rather than invent columns.
             return html_code
 
-        # Page continuations often omit trailing empty cells (for example an
-        # unused "Ghi chú" column). Preserve the common schema by padding only
-        # the missing trailing cells instead of exposing the HTML as code.
-        parser.rows = [row + [""] * (num_cols - len(row)) for row in parser.rows]
+        grid = parser.to_grid()
+        if not grid or len(grid) < 2 or len(grid[0]) < 2:
+            return html_code
 
+        # Xác định số lượng hàng header
+        header_row_count = 0
+        for r_idx, row in enumerate(parser.rows_raw):
+            if all(cell[3] for cell in row):
+                header_row_count += 1
+            else:
+                break
+        if header_row_count == 0:
+            header_row_count = 1
+        else:
+            header_row_count = min(header_row_count, len(grid) - 1)
+
+        num_cols = len(grid[0])
+        if header_row_count == 1:
+            header_row = grid[0]
+            data_rows = grid[1:]
+        else:
+            header_row = []
+            for col_idx in range(num_cols):
+                parts = [grid[r][col_idx].strip() for r in range(header_row_count) if grid[r][col_idx].strip()]
+                dedup_parts = []
+                for p in parts:
+                    if not dedup_parts or p != dedup_parts[-1]:
+                        dedup_parts.append(p)
+                header_row.append("<br>".join(dedup_parts) if dedup_parts else "")
+            data_rows = grid[header_row_count:]
+
+        if not data_rows:
+            return html_code
 
         md_lines = []
-        header_row = parser.rows[0]
         header_normalized = [c.strip().casefold() for c in header_row]
         md_lines.append("| " + " | ".join(c.replace("|", "\\|") for c in header_row) + " |")
         md_lines.append("| " + " | ".join(":---" for _ in range(num_cols)) + " |")
 
-        for data_row in parser.rows[1:]:
+        for data_row in data_rows:
             row_normalized = [c.strip().casefold() for c in data_row]
             if row_normalized == header_normalized:
                 continue
@@ -2273,7 +2520,6 @@ def convert_simple_html_tables_to_markdown(markdown: str) -> tuple[str, int]:
 
         converted_count += 1
         return "\n\n" + "\n".join(md_lines) + "\n\n"
-
 
     result = table_re.sub(replace_table, markdown)
     result = re.sub(r"\n{3,}", "\n\n", result)
@@ -2419,15 +2665,25 @@ def structural_blank_page_numbers(pdf_path: Path) -> set[int]:
     return pages
 
 
-# Hàm render trang chứa bảng biểu với độ phân giải (DPI) cao
-def render_table_page(pdf_path: Path, page_index: int, output_dir: Path, dpi: int = TABLE_RENDER_DPI) -> Path:
-    """Render trang có bảng với DPI cao hơn để nâng cao độ nét ảnh giúp OCR bảng chính xác hơn."""
+# Hàm render trang chứa bảng biểu với độ phân giải siêu nét (DPI cao) và tăng độ tương phản lưới kẻ
+def render_table_page(pdf_path: Path, page_index: int, output_dir: Path, dpi: int = TABLE_RENDER_DPI, enhance_grid: bool = True) -> Path:
+    """Render trang có bảng với DPI cao (400 DPI) và tăng tương phản đường kẻ lưới giúp AI nhìn rõ từng ô bảng."""
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"page_{page_index + 1}_table_{dpi}dpi.png"
     doc = pymupdf.open(pdf_path)
     try:
         pix = doc.load_page(page_index).get_pixmap(dpi=dpi, colorspace=pymupdf.csRGB, alpha=False)
         pix.save(str(output_path))
+        if enhance_grid:
+            try:
+                with Image.open(output_path) as img:
+                    # Tăng nhẹ độ tương phản và độ nét để làm rõ các đường kẻ viền và ô phân tách thanh mảnh
+                    enhanced = ImageEnhance.Contrast(img.convert("RGB")).enhance(1.12)
+                    enhanced = enhanced.filter(ImageFilter.UnsharpMask(radius=1.2, percent=110, threshold=3))
+                    enhanced.save(output_path, format="PNG")
+                    enhanced.close()
+            except Exception:
+                pass
     finally:
         doc.close()
     return output_path
@@ -2492,7 +2748,7 @@ def ocr_qwen_images(
                 model=model, prompt=PROMPT + instruction, images=[str(image_path)],
                 think=False, stream=True,
                 options={"temperature": 0, "num_ctx": 8192, "num_predict": 4096},
-                keep_alive="10m",
+                keep_alive="30m",
             ),
             max_retries=max_retries, log_func=log_func,
         )
@@ -2501,9 +2757,24 @@ def ocr_qwen_images(
         parts.append(clean_markdown(raw))
 
     joined = "\n\n".join(part for part in parts if part.strip())
-    if not joined and blank_confirmations and all(blank_confirmations):
+    if not joined:
         return BlankOCRResult("")
     return joined
+
+
+def warmup_qwen_model(client, model: str = MODEL, keep_alive: str = "30m", log_func=print) -> bool:
+    """Nạp sẵn mô hình Qwen Vision vào VRAM/RAM để request đầu tiên chạy tức thì."""
+    try:
+        client.generate(
+            model=model,
+            prompt="",
+            stream=False,
+            keep_alive=keep_alive,
+        )
+        return True
+    except Exception as e:
+        log_func(f"    -> [Warning] Không thể nạp sẵn mô hình '{model}': {e}")
+        return False
 
 
 def ocr_coordinate_blocks(

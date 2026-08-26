@@ -15,7 +15,7 @@ from typing import Any
 class PaddleOCREngine:
     """
     Chuẩn hóa kết quả của PaddleOCR 3.x thành văn bản thuần túy theo thứ tự đọc.
-    
+
     Sử dụng tham số ``lang='vi'`` để gọi mô hình tiếng Việt chuyên dụng.
     """
 

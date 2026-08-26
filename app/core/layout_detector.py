@@ -12,6 +12,7 @@ from typing import Any
 # PaddleX otherwise probes public model hosters even when cached/local models are
 # intended. Set this before importing paddleocr in LayoutDetector.__post_init__.
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+os.environ.setdefault("GLOG_minloglevel", "3")
 
 # pyrefly: ignore [missing-import]
 import numpy as np
@@ -73,16 +74,16 @@ def _resize_image_bytes(image_bytes: bytes, max_width: int = 800) -> tuple[bytes
         orig_w, orig_h = img.width, img.height
         if orig_w <= max_width:
             return image_bytes, 1.0, 1.0
-        
+
         new_w = max_width
         new_h = int(orig_h * (max_width / orig_w))
-        
+
         resample_filter = getattr(Image, "Resampling", Image).LANCZOS
         resized_img = img.resize((new_w, new_h), resample_filter)
-        
+
         bio = BytesIO()
         resized_img.save(bio, format="PNG")
-        
+
         scale_x = orig_w / new_w
         scale_y = orig_h / new_h
         return bio.getvalue(), scale_x, scale_y
@@ -119,46 +120,46 @@ def recursive_xy_cut(boxes: list[BoundingBox], min_x_gap: float = 15.0, min_y_ga
         return []
     if len(boxes) == 1:
         return boxes
-    
+
     left = min(b[0] for b in boxes)
     top = min(b[1] for b in boxes)
     right = max(b[2] for b in boxes)
     bottom = max(b[3] for b in boxes)
-    
+
     # Try Y cut first
     y_sorted = sorted(boxes, key=lambda b: b[1])
     max_y = y_sorted[0][3]
     best_y_split = None
-    
+
     for i in range(1, len(y_sorted)):
         box = y_sorted[i]
         if box[1] > max_y + min_y_gap:
             best_y_split = max_y + (box[1] - max_y) / 2
             break
         max_y = max(max_y, box[3])
-        
+
     if best_y_split is not None:
         top_boxes = [b for b in boxes if b[3] <= best_y_split]
         bottom_boxes = [b for b in boxes if b[1] > best_y_split]
         return recursive_xy_cut(top_boxes, min_x_gap, min_y_gap) + recursive_xy_cut(bottom_boxes, min_x_gap, min_y_gap)
-        
+
     # Try X cut
     x_sorted = sorted(boxes, key=lambda b: b[0])
     max_x = x_sorted[0][2]
     best_x_split = None
-    
+
     for i in range(1, len(x_sorted)):
         box = x_sorted[i]
         if box[0] > max_x + min_x_gap:
             best_x_split = max_x + (box[0] - max_x) / 2
             break
         max_x = max(max_x, box[2])
-        
+
     if best_x_split is not None:
         left_boxes = [b for b in boxes if b[2] <= best_x_split]
         right_boxes = [b for b in boxes if b[0] > best_x_split]
         return recursive_xy_cut(left_boxes, min_x_gap, min_y_gap) + recursive_xy_cut(right_boxes, min_x_gap, min_y_gap)
-        
+
     # If no cuts, return the bounding box of the remaining cluster
     return [(left, top, right, bottom)]
 
@@ -171,8 +172,8 @@ def merge_column_blocks(boxes: list[BoundingBox], image_width: int, image_height
         prev = merged[-1]
         # Merge if they are vertically adjacent and have similar X bounds (e.g., belong to same column)
         # Tolerance for column width/alignment
-        if (abs(current[0] - prev[0]) < image_width * 0.1 and 
-            abs(current[2] - prev[2]) < image_width * 0.1 and 
+        if (abs(current[0] - prev[0]) < image_width * 0.1 and
+            abs(current[2] - prev[2]) < image_width * 0.1 and
             current[1] >= prev[3] - 20):
             merged[-1] = (
                 min(prev[0], current[0]),
@@ -182,7 +183,7 @@ def merge_column_blocks(boxes: list[BoundingBox], image_width: int, image_height
             )
         else:
             merged.append(current)
-    
+
     # Expand slightly to avoid cutting text
     padded = []
     pad = 5.0
@@ -201,10 +202,10 @@ def detect_reading_segments(regions: list[BoundingBox], image_width: int, image_
     usable = [box for box in regions if box[2] > box[0] and box[3] > box[1]]
     if not usable:
         return [(0.0, 0.0, float(image_width), float(image_height))]
-        
+
     # Apply recursive XY-cut
     cut_boxes = recursive_xy_cut(usable, min_x_gap=max(image_width * 0.05, 20.0), min_y_gap=15.0)
-    
+
     # Merge vertically adjacent blocks in the same column
     final_segments = merge_column_blocks(cut_boxes, image_width, image_height)
     return final_segments
@@ -279,13 +280,13 @@ class LayoutDetector:
                 else:
                     left, top = float(points[:, 0].min()), float(points[:, 1].min())
                     right, bottom = float(points[:, 0].max()), float(points[:, 1].max())
-                
+
                 # Scale coordinates
                 left *= scale_x
                 top *= scale_y
                 right *= scale_x
                 bottom *= scale_y
-                
+
                 region = (left, top, right, bottom)
                 all_regions.append(region)
                 if str(item_label).casefold() == "table":
@@ -388,13 +389,13 @@ class LayoutDetector:
                 else:
                     left, top = float(points[:, 0].min()), float(points[:, 1].min())
                     right, bottom = float(points[:, 0].max()), float(points[:, 1].max())
-                
+
                 # Scale coordinates
                 left *= scale_x
                 top *= scale_y
                 right *= scale_x
                 bottom *= scale_y
-                
+
                 region = (left, top, right, bottom)
                 if str(item_label).casefold() == "table":
                     tables.append(region)
@@ -425,13 +426,13 @@ class LayoutDetector:
                 else:
                     left, top = float(points[:, 0].min()), float(points[:, 1].min())
                     right, bottom = float(points[:, 0].max()), float(points[:, 1].max())
-                
+
                 # Scale coordinates
                 left *= scale_x
                 top *= scale_y
                 right *= scale_x
                 bottom *= scale_y
-                
+
                 region = (left, top, right, bottom)
                 label_lower = str(item_label).casefold()
                 if label_lower == "table":
@@ -455,7 +456,7 @@ class LayoutDetector:
             width, height = image.width, image.height
         text_regions = self.detect_text_regions(image_bytes)
         layout_regions, table_regions = self.detect_layout_regions(image_bytes)
-        
+
         all_regions = text_regions + layout_regions
         segments = detect_reading_segments(all_regions, width, height)
         return segments, bool(table_regions), text_regions, table_regions
@@ -469,22 +470,22 @@ def crop_segments(image_path: str | Path, segments: list[BoundingBox], output_di
             return [source]
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)
-        
+
         crops = []
         for left, top, right, bottom in segments:
             crop_box = (int(left), int(top), int(right), int(bottom))
             crops.append(image.crop(crop_box))
-            
+
         # Stitch vertically
         total_height = sum(c.height for c in crops) + 20 * (len(crops) - 1)
         max_width = max(c.width for c in crops)
-        
+
         stitched = Image.new('RGB', (max_width, total_height), 'white')
         y_offset = 0
         for c in crops:
             stitched.paste(c, (0, y_offset))
             y_offset += c.height + 20
-            
+
         stitched_path = output / f"{source.stem}_stitched_segments.png"
         stitched.save(stitched_path)
         return [stitched_path]
@@ -531,7 +532,7 @@ def save_layout_overlay(
     """Create a diagnostic image; it never alters the OCR input/output image."""
     with Image.open(image_path) as source:
         image = source.convert("RGB")
-    
+
     # Import ImageFont for larger font size
     try:
         # pyrefly: ignore [missing-import]
@@ -539,7 +540,7 @@ def save_layout_overlay(
         font = ImageFont.truetype("arial.ttf", 32)
     except IOError:
         font = None
-        
+
     draw = ImageDraw.Draw(image)
     for left, top, right, bottom in text_regions:
         draw.rectangle((left, top, right, bottom), outline="#1688ff", width=2)

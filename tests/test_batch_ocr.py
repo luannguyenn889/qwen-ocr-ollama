@@ -648,6 +648,47 @@ class BatchOcrTests(unittest.TestCase):
         self.assertIn("| 3 | Lê Văn C | TP.HCM |", merged)
         self.assertIn("| 4 | Phạm Thị D | Cần Thơ |", merged)
 
+    def test_merge_markdown_tables_hierarchical_stt_continuation(self):
+        page_1 = (
+            "| STT | Chỉ tiêu | ĐVT | Số liệu |\n"
+            "| :--- | :--- | :--- | :--- |\n"
+            "| 4.1. | Nhiệm vụ giao | Vụ | 10 |\n"
+            "| 4.2. | Đúng hạn | Vụ | 8 |"
+        )
+        page_2 = (
+            "| STT | Chỉ tiêu | ĐVT | Số liệu |\n"
+            "| :--- | :--- | :--- | :--- |\n"
+            "| 4.3. | Quá hạn | Vụ | 2 |\n"
+            "| 5. | Khảo sát | Phiếu | 100 |"
+        )
+        content = f"{page_1}\n\n<!-- Page 2 -->\n\n{page_2}"
+        merged = merge_markdown_tables(content)
+        self.assertEqual(merged.count("| :--- | :--- | :--- | :--- |"), 1)
+        self.assertIn("| 4.2. | Đúng hạn | Vụ | 8 |", merged)
+        self.assertIn("| 4.3. | Quá hạn | Vụ | 2 |", merged)
+        self.assertIn("| 5. | Khảo sát | Phiếu | 100 |", merged)
+
+    def test_merge_html_tables_deduplicates_repeated_header(self):
+        page_1 = (
+            "<table>\n"
+            "<thead><tr><th>STT</th><th>Nội dung</th></tr></thead>\n"
+            "<tbody><tr><td>1</td><td>Dòng 1</td></tr></tbody>\n"
+            "</table>"
+        )
+        page_2 = (
+            "<table>\n"
+            "<thead><tr><th>STT</th><th>Nội dung</th></tr></thead>\n"
+            "<tbody><tr><td>2</td><td>Dòng 2</td></tr></tbody>\n"
+            "</table>"
+        )
+        content = f"{page_1}\n\n<!-- Page 2 -->\n\n{page_2}"
+        merged = merge_markdown_tables(content)
+        self.assertEqual(merged.count("<table>"), 1)
+        self.assertEqual(merged.count("</table>"), 1)
+        self.assertEqual(merged.count("<th>STT</th>"), 1)
+        self.assertIn("<td>1</td>", merged)
+        self.assertIn("<td>2</td>", merged)
+
     def test_finalizer_normalizes_heading_and_paragraph_breaks(self):
         malformed = "#Tiêu đề\n\n####Mục con\n\nĐây là một câu bị\nngắt giữa dòng."
         repaired = finalize_markdown(malformed)
@@ -1060,7 +1101,7 @@ class BatchOcrTests(unittest.TestCase):
             mock_context = mock_img.__enter__.return_value
             mock_context.width = 1000
             mock_context.height = 1000
-            
+
             # Mock layout_detector
             mock_detector = MagicMock()
             # Bounding box 1: column 2, top (y=100) -> center_x = 650
@@ -1175,7 +1216,7 @@ class BatchOcrTests(unittest.TestCase):
         from unittest.mock import MagicMock
         # Mock dependencies
         client = MagicMock()
-        
+
         # We need mock client generate to return stream chunks
         class DummyChunk:
             def __init__(self, response):
@@ -1183,7 +1224,7 @@ class BatchOcrTests(unittest.TestCase):
         client.generate.return_value = [
             DummyChunk("This is formula_placeholder and another formula_placeholder.")
         ]
-        
+
         # Mock layout detector to return a dummy formula box
         mock_detector = MagicMock()
         from app.core.layout_detector import PageLayoutAnalysis
@@ -1207,20 +1248,57 @@ class BatchOcrTests(unittest.TestCase):
             img = Image.new("RGB", (1000, 1000), "white")
             img_path = Path(temp_dir) / "page_1.png"
             img.save(img_path)
-            
+
             pdf_path = Path(temp_dir) / "input.pdf"
             pdf_path.write_bytes(b"pdf")
-            
+
             output_dir = Path(temp_dir) / "output"
             result = process_single_pdf(
                 pdf_path, output_dir, client, "qwen3.5:4b",
                 skip_blank_pages=False,
             )
-            
+
             # Read output markdown
             md_content = result.read_text(encoding="utf-8")
             self.assertIn("$E = mc^2$", md_content)
             self.assertIn("$a^2 + b^2 = c^2$", md_content)
+
+    def test_merge_html_tables_deduplicates_multi_tier_repeated_headers(self):
+        page_1 = (
+            "<table>\n"
+            "<tr><th rowspan=\"2\">STT</th><th colspan=\"2\">Kết quả</th></tr>\n"
+            "<tr><th>ĐVT</th><th>Số liệu</th></tr>\n"
+            "<tr><td>1</td><td>Văn bản</td><td>10</td></tr>\n"
+            "</table>"
+        )
+        page_2 = (
+            "<table>\n"
+            "<tr><th rowspan=\"2\">STT</th><th colspan=\"2\">Kết quả</th></tr>\n"
+            "<tr><th>ĐVT</th><th>Số liệu</th></tr>\n"
+            "<tr><td>2</td><td>Văn bản</td><td>20</td></tr>\n"
+            "</table>"
+        )
+        content = f"{page_1}\n\n<!-- Page 2 -->\n\n{page_2}"
+        merged = merge_markdown_tables(content)
+        self.assertEqual(merged.count("<table>"), 1)
+        self.assertEqual(merged.count("</table>"), 1)
+        self.assertEqual(merged.count("<th>ĐVT</th>"), 1)
+        self.assertIn("<td>1</td>", merged)
+        self.assertIn("<td>2</td>", merged)
+
+    def test_clean_html_table_intermediate_headers(self):
+        content = (
+            "<table>\n"
+            "<tr><th>STT</th><th>Nội dung</th><th>Số liệu</th></tr>\n"
+            "<tr><td>1</td><td>Chỉ tiêu 1</td><td>100</td></tr>\n"
+            "<tr><th>Đơn vị tính</th><th>Số liệu</th></tr>\n"
+            "<tr><td>2</td><td>Chỉ tiêu 2</td><td>200</td></tr>\n"
+            "</table>"
+        )
+        merged = merge_markdown_tables(content)
+        self.assertNotIn("<tr><th>Đơn vị tính</th><th>Số liệu</th></tr>", merged)
+        self.assertIn("<td>1</td>", merged)
+        self.assertIn("<td>2</td>", merged)
 
 
 if __name__ == "__main__":

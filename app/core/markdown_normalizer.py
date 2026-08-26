@@ -170,7 +170,7 @@ def normalize_paragraphs_and_lists(markdown: str, stats: MarkdownNormalizationSt
 
 
 def normalize_images(markdown: str, stats: MarkdownNormalizationStats | None = None) -> str:
-    """Normalize local image paths and remove exact duplicate image entries."""
+    """Normalize local image paths, enclose paths with spaces in <...>, and remove duplicate entries."""
     seen: set[str] = set()
 
     def replace(match: re.Match[str]) -> str:
@@ -187,7 +187,9 @@ def normalize_images(markdown: str, stats: MarkdownNormalizationStats | None = N
                 stats.duplicate_images += 1
             return ""
         seen.add(key)
-        return f"![{alt.strip()}]({target})"
+        # Enclose target in <...> if it contains whitespace (CommonMark standard)
+        formatted_target = f"<{target}>" if " " in target else target
+        return f"![{alt.strip()}]({formatted_target})"
 
     return _IMAGE_RE.sub(replace, markdown)
 
@@ -394,13 +396,144 @@ def stitch_cross_page_paragraphs(
     return pattern.sub(repl, markdown)
 
 
+def strip_assistant_conversational_artifacts(markdown: str) -> str:
+    """Remove assistant preambles, prompt leakage, and conversational meta-artifacts."""
+    page_blocks = re.split(r"(<!--\s*Page\s+\d+\s*-->)", markdown, flags=re.IGNORECASE)
+    cleaned_blocks = []
+    from app.core.batch_ocr import is_blank_ocr_response
+    for block in page_blocks:
+        if re.fullmatch(r"<!--\s*Page\s+\d+\s*-->", block.strip(), re.IGNORECASE):
+            cleaned_blocks.append(block)
+            continue
+        if is_blank_ocr_response(block):
+            cleaned_blocks.append("")
+            continue
+        cleaned = re.sub(
+            r"\A\s*(?:(?:Here (?:is|are)|Below is|Dưới đây là|Certainly|Sure|Based on (?:your|the) requirements)[^\n]*?(?:OCR|transcription|extracted|requested|chuyển đổi|văn bản)?[^\n]*?:\s*\n+)+",
+            "",
+            block,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(
+            r"\n+\s*(?:I hope this (?:helps|is helpful)|Let me know if you (?:need|have)|End of transcription|Đó là toàn bộ nội dung)[^\n]*\Z",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned_blocks.append(cleaned)
+    return "".join(cleaned_blocks)
+
+
+def normalize_checkboxes(markdown: str) -> str:
+    """Normalize OCR checkbox artifacts to standard Markdown task list items or form markers."""
+    # Convert checked variations like [v], [V], [x], [X], [*], ☑, ✓, ✔
+    # 1. Unicode checkboxes at start of line
+    markdown = re.sub(r"(?m)^(\s*[-*+]?\s*)[☑☒✓✔]\s*", r"\1- [x] ", markdown)
+    markdown = re.sub(r"(?m)^(\s*[-*+]?\s*)☐\s*", r"\1- [ ] ", markdown)
+
+    # 2. [v], [V], [X], [x], [*] at start of line / list
+    markdown = re.sub(r"(?m)^(\s*[-*+]?\s*)\[[vVxX*✓✔]\]\s*", r"\1- [x] ", markdown)
+    markdown = re.sub(r"(?m)^(\s*[-*+]?\s*)\[\s*\]\s*", r"\1- [ ] ", markdown)
+
+    # 3. Inline checkboxes in form fields (e.g., "Nam [x]  Nữ [ ]")
+    markdown = re.sub(r"\[[vVxX*✓✔]\]", "[x]", markdown)
+    markdown = re.sub(r"[☑☒]", "[x]", markdown)
+    markdown = re.sub(r"☐", "[ ]", markdown)
+
+    # 4. Clean up duplicate bullet markers like "- - [x]" -> "- [x]"
+    markdown = re.sub(r"(?m)^\s*[-*+]\s+[-*+]\s+\[([ xX])\]", r"- [\1]", markdown)
+    return markdown
+
+
+def normalize_special_symbols(markdown: str) -> str:
+    """Normalize OCR artifacts in units, dimensions, temperatures, and legal/math symbols."""
+    # Degrees Celsius: 37 oC, 37 0C, 37oC, 37 °C -> 37°C
+    markdown = re.sub(r"(\b\d+(?:[.,]\d+)?)\s*(?:o|O|0|°)\s*C\b", r"\1°C", markdown)
+    # Degrees Fahrenheit
+    markdown = re.sub(r"(\b\d+(?:[.,]\d+)?)\s*(?:o|O|0|°)\s*F\b", r"\1°F", markdown)
+    # Dimension x: 200 x 300 or 200 X 300 -> 200 × 300
+    markdown = re.sub(r"(\b\d+(?:[.,]\d+)?)\s*[xX]\s*(\b\d+(?:[.,]\d+)?)", r"\1 × \2", markdown)
+    # Micro units: ug, um, ul, us -> µg, µm, µl, µs (in measurement context)
+    markdown = re.sub(r"(\b\d+(?:[.,]\d+)?\s*)u([gmlsL])\b", r"\1µ\2", markdown)
+    # Plus-minus: + - or +- -> ±
+    markdown = re.sub(r"(?<=\d|\s)\+\s*-\s*(?=\d)", "±", markdown)
+    # Comparisons: <= -> ≤, >= -> ≥, ~= -> ≈
+    markdown = re.sub(r"(?<=\d|\w|\s)<=(?=\s*\d)", "≤", markdown)
+    markdown = re.sub(r"(?<=\d|\w|\s)>=(?=\s*\d)", "≥", markdown)
+    markdown = re.sub(r"(?<=\d|\w|\s)~=(?=\s*\d)", "≈", markdown)
+    # Copyright / Registered / Trademark
+    markdown = re.sub(r"\([cC]\)", "©", markdown)
+    markdown = re.sub(r"\([rR]\)", "®", markdown)
+    markdown = re.sub(r"\((?:tm|TM)\)", "™", markdown)
+    return markdown
+
+
+def collapse_inline_repetitions(markdown: str) -> str:
+    """Collapse repeated phrase loops occurring within individual lines."""
+    lines = markdown.splitlines()
+    output: list[str] = []
+    fenced = display_math = False
+    html_table_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+        if not fenced and stripped == "$$":
+            display_math = not display_math
+        html_table_depth += len(re.findall(r"<table\b", stripped, re.IGNORECASE))
+        protected = fenced or display_math or html_table_depth > 0
+        html_table_depth = max(
+            0, html_table_depth - len(re.findall(r"</table>", stripped, re.IGNORECASE))
+        )
+        if protected or len(line) < 30:
+            output.append(line)
+            continue
+
+        def clean_line_repetitions(s: str) -> str:
+            # Check repeated phrases of length from 8 to 80 chars
+            for repeat_len in range(8, min(80, len(s) // 3 + 1)):
+                pattern = re.compile(
+                    r"((?:,\s*|;\s*|\s+)?([A-Za-zÀ-ỹĐđ0-9\s-]{" + str(repeat_len) + r",}?))(?:\1){2,}",
+                    re.IGNORECASE,
+                )
+                match = pattern.search(s)
+                if match:
+                    chunk = match.group(1)
+                    full_run = match.group(0)
+                    s = s.replace(full_run, chunk)
+                    # Clean trailing partial fragment if line was truncated
+                    phrase_core = match.group(2).strip()
+                    words = phrase_core.split()
+                    if len(words) >= 2:
+                        for partial_count in range(len(words) - 1, 0, -1):
+                            partial_prefix = " ".join(words[:partial_count])
+                            if s.rstrip().endswith((f", {partial_prefix}", f" {partial_prefix}")):
+                                s = re.sub(rf"(?:,\s*|\s+){re.escape(partial_prefix)}\s*$", "", s)
+            return s
+
+        prev_line = ""
+        current_line = line
+        for _ in range(3):
+            if current_line == prev_line:
+                break
+            prev_line = current_line
+            current_line = clean_line_repetitions(current_line)
+
+        output.append(current_line)
+    return "\n".join(output)
+
+
 def normalize_structure(
     markdown: str, stats: MarkdownNormalizationStats | None = None
 ) -> str:
     """Apply safe structural repairs before table/math-specific finalization."""
+    markdown = strip_assistant_conversational_artifacts(markdown)
     markdown = collapse_repetition_loops(markdown, stats)
+    markdown = collapse_inline_repetitions(markdown)
     markdown = normalize_headings(markdown, stats)
     markdown = normalize_paragraphs_and_lists(markdown, stats)
+    markdown = normalize_checkboxes(markdown)
+    markdown = normalize_special_symbols(markdown)
     markdown = normalize_images(markdown, stats)
     markdown = remove_standalone_page_artifacts(markdown, stats)
     markdown = stitch_cross_page_paragraphs(markdown, stats)

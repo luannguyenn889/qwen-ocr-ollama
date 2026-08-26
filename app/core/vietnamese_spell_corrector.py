@@ -43,12 +43,17 @@ def _unaccented(value: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def _load_lexicon() -> tuple[frozenset[str], dict[str, tuple[str, ...]], frozenset[tuple[str, str]]]:
+def _load_lexicon() -> tuple[
+    frozenset[str],
+    dict[str, tuple[str, ...]],
+    frozenset[tuple[str, str]],
+    frozenset[tuple[str, str, str]],
+]:
     """Load the replaceable JSON lexicon once per process."""
     try:
         data = json.loads(LEXICON_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
-        return frozenset(), {}, frozenset()
+        return frozenset(), {}, frozenset(), frozenset()
 
     words = frozenset(str(word).casefold() for word in data.get("words", []))
     candidates: dict[str, tuple[str, ...]] = {}
@@ -61,7 +66,12 @@ def _load_lexicon() -> tuple[frozenset[str], dict[str, tuple[str, ...]], frozens
         for item in data.get("bigrams", [])
         if len(parts := str(item).split()) == 2
     )
-    return words, candidates, bigrams
+    trigrams = frozenset(
+        (parts[0].casefold(), parts[1].casefold(), parts[2].casefold())
+        for item in data.get("trigrams", [])
+        if len(parts := str(item).split()) == 3
+    )
+    return words, candidates, bigrams, trigrams
 
 
 def _case_style(source: str, replacement: str) -> str:
@@ -74,54 +84,117 @@ def _case_style(source: str, replacement: str) -> str:
 
 def _options(token: str, words: frozenset[str], candidates: dict[str, tuple[str, ...]]) -> tuple[str, ...]:
     normalized = token.casefold()
-    if normalized in words:
-        return (normalized,)
-    return candidates.get(_unaccented(normalized), ())
+    unacc = _unaccented(normalized)
+    pool = candidates.get(unacc, ())
+    if not pool:
+        return (normalized,) if normalized in words else ()
+    res = [normalized] if (normalized in pool or normalized in words) else []
+    for item in pool:
+        if item not in res:
+            res.append(item)
+    return tuple(res)
+
+
+def _has_vn_diacritic(value: str) -> bool:
+    return any(
+        unicodedata.category(c) == "Mn" or c.casefold() in ("đ", "ă", "â", "ê", "ô", "ơ", "ư")
+        for c in value
+    )
+
+
+REPEATED_WORDS_RE = re.compile(
+    r"\b(các|những|và|là|của|trong|được|có|với|đã|đang|sẽ|cho|về|tại|từ|bởi|do)\s+\1\b",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _dedup_repeated_words(text: str) -> tuple[str, int]:
+    count = 0
+    def repl(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return m.group(1)
+    new_text, n = REPEATED_WORDS_RE.subn(repl, text)
+    return new_text, n
 
 
 def _correct_unmasked(text: str) -> tuple[str, int]:
-    words, candidates, bigrams = _load_lexicon()
-    if not words or not candidates or not bigrams:
-        return text, 0
+    text, dedup_count = _dedup_repeated_words(text)
+    words, candidates, bigrams, trigrams = _load_lexicon()
+    if not words or not candidates:
+        return text, dedup_count
 
     matches = list(WORD_RE.finditer(text))
     replacements: dict[int, str] = {}
-    reserved: set[int] = set()
-    for index in range(len(matches) - 1):
-        if index in reserved or index + 1 in reserved:
-            continue
-        left_source = matches[index].group(0)
-        right_source = matches[index + 1].group(0)
-        # All-uppercase tokens commonly denote names, agencies, acronyms, or
-        # document identifiers. Image-free lexical evidence is insufficient to
-        # alter or flag them safely.
-        if left_source.isupper() or right_source.isupper():
-            continue
-        if left_source.istitle() and right_source.istitle():
-            continue
-        separator = text[matches[index].end():matches[index + 1].start()]
-        if not re.fullmatch(r"[ \t\r\n]+", separator) or "\n\n" in separator.replace("\r", ""):
-            continue
-        left_options = _options(left_source, words, candidates)
-        right_options = _options(right_source, words, candidates)
-        if not left_options or not right_options:
-            continue
-        valid = [(left, right) for left in left_options for right in right_options if (left, right) in bigrams]
-        if len(valid) != 1:
-            continue
-        left, right = valid[0]
-        changed = False
-        if left != left_source.casefold():
-            replacements[index] = _case_style(left_source, left)
-            changed = True
-        if right != right_source.casefold():
-            replacements[index + 1] = _case_style(right_source, right)
-            changed = True
-        if changed:
-            reserved.update((index, index + 1))
+
+    def current_token(idx: int) -> str:
+        return replacements.get(idx, matches[idx].group(0))
+
+    # Pass 1: Trigram verification (highest confidence)
+    if trigrams and len(matches) >= 3:
+        for index in range(len(matches) - 2):
+            w1_src = current_token(index)
+            w2_src = current_token(index + 1)
+            w3_src = current_token(index + 2)
+            all_upper = w1_src.isupper() and w2_src.isupper() and w3_src.isupper()
+            if w1_src.isupper() or w2_src.isupper() or w3_src.isupper():
+                if not (all_upper and (_has_vn_diacritic(w1_src) or _has_vn_diacritic(w2_src) or _has_vn_diacritic(w3_src))):
+                    continue
+            if w1_src.istitle() and w2_src.istitle() and w3_src.istitle():
+                continue
+            sep1 = text[matches[index].end():matches[index + 1].start()]
+            sep2 = text[matches[index + 1].end():matches[index + 2].start()]
+            if not re.fullmatch(r"[ \t\r\n]+", sep1) or "\n\n" in sep1.replace("\r", ""):
+                continue
+            if not re.fullmatch(r"[ \t\r\n]+", sep2) or "\n\n" in sep2.replace("\r", ""):
+                continue
+            w1_opts = _options(w1_src, words, candidates)
+            w2_opts = _options(w2_src, words, candidates)
+            w3_opts = _options(w3_src, words, candidates)
+            if not w1_opts or not w2_opts or not w3_opts:
+                continue
+            valid_tri = [
+                (a, b, c) for a in w1_opts for b in w2_opts for c in w3_opts
+                if (a, b, c) in trigrams
+            ]
+            if len(valid_tri) == 1:
+                a, b, c = valid_tri[0]
+                if a != w1_src.casefold():
+                    replacements[index] = _case_style(matches[index].group(0), a)
+                if b != w2_src.casefold():
+                    replacements[index + 1] = _case_style(matches[index + 1].group(0), b)
+                if c != w3_src.casefold():
+                    replacements[index + 2] = _case_style(matches[index + 2].group(0), c)
+
+    # Pass 2: Bigram verification
+    if bigrams and len(matches) >= 2:
+        for index in range(len(matches) - 1):
+            left_source = current_token(index)
+            right_source = current_token(index + 1)
+            all_upper = left_source.isupper() and right_source.isupper()
+            if left_source.isupper() or right_source.isupper():
+                if not (all_upper and (_has_vn_diacritic(left_source) or _has_vn_diacritic(right_source))):
+                    continue
+            if left_source.istitle() and right_source.istitle():
+                continue
+            separator = text[matches[index].end():matches[index + 1].start()]
+            if not re.fullmatch(r"[ \t\r\n]+", separator) or "\n\n" in separator.replace("\r", ""):
+                continue
+            left_options = _options(left_source, words, candidates)
+            right_options = _options(right_source, words, candidates)
+            if not left_options or not right_options:
+                continue
+            valid = [(left, right) for left in left_options for right in right_options if (left, right) in bigrams]
+            if len(valid) != 1:
+                continue
+            left, right = valid[0]
+            if left != left_source.casefold():
+                replacements[index] = _case_style(matches[index].group(0), left)
+            if right != right_source.casefold():
+                replacements[index + 1] = _case_style(matches[index + 1].group(0), right)
 
     if not replacements:
-        return text, 0
+        return text, dedup_count
     pieces: list[str] = []
     cursor = 0
     for index, match in enumerate(matches):
@@ -129,18 +202,34 @@ def _correct_unmasked(text: str) -> tuple[str, int]:
         pieces.append(replacements.get(index, match.group(0)))
         cursor = match.end()
     pieces.append(text[cursor:])
-    return "".join(pieces), len(replacements)
+    return "".join(pieces), len(replacements) + dedup_count
+
+
+TABLE_SEPARATOR_ROW_RE = re.compile(r"^\s*\|?\s*(?::?-+:?\s*\|)+\s*(?::?-+:?\s*)?\|?\s*$")
+CELL_SAFE_VALUE_RE = re.compile(
+    r"^\s*(?:[\d.,/%+-]+|[A-ZĐ0-9._/-]{1,12}|[A-Za-z0-9._/-]+\s*=\s*\d+)?\s*$",
+    re.IGNORECASE,
+)
 
 
 def correct_vietnamese_spelling(markdown: str) -> tuple[str, int]:
     """Correct uniquely-confirmed Vietnamese bigrams outside protected regions."""
     spans = [(match.start(), match.end()) for match in MASK_RE.finditer(markdown)]
-    # Pipe-table cells frequently contain identifiers, names, and compact data;
-    # never apply image-free spelling guesses inside them.
     offset = 0
     for line in markdown.splitlines(keepends=True):
-        if line.strip().startswith("|"):
-            spans.append((offset, offset + len(line)))
+        stripped = line.strip()
+        if stripped.startswith("|"):
+            if TABLE_SEPARATOR_ROW_RE.match(stripped):
+                spans.append((offset, offset + len(line)))
+            else:
+                # Mask pipe characters
+                for match in re.finditer(r"\|", line):
+                    spans.append((offset + match.start(), offset + match.end()))
+                # Mask numeric/code/short identifier cells
+                for cell_m in re.finditer(r"[^|]+", line):
+                    cell_text = cell_m.group(0)
+                    if CELL_SAFE_VALUE_RE.match(cell_text):
+                        spans.append((offset + cell_m.start(), offset + cell_m.end()))
         offset += len(line)
     table_start: int | None = None
     table_depth = 0

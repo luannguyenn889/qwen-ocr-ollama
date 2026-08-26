@@ -264,6 +264,7 @@ def _review_client(client, timeout_seconds: float = 45.0):
     base_url_text = str(base_url or "")
     if not base_url_text.startswith(("http://", "https://")):
         return client, None
+    # pyrefly: ignore [missing-import]
     from ollama import Client
     bounded = Client(host=base_url_text, timeout=timeout_seconds)
     return bounded, getattr(getattr(bounded, "_client", None), "close", None)
@@ -502,7 +503,7 @@ printed_lines phải rỗng."""
                 "num_ctx": 8192,
                 "num_predict": min(1024, 256 + 256 * len(candidates)),
             },
-            keep_alive="10m",
+            keep_alive="30m",
         )
         raw = _response_text(response).strip()
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.I)

@@ -45,7 +45,7 @@ def _clean_block(text: str) -> str:
 def extract_native_text(page: pymupdf.Page) -> NativeTextPage:
     """
     Trích xuất các khối văn bản thực tế của PDF theo thứ tự đọc trực quan.
-    
+
     Hàm này chỉ lấy văn bản, không tự động sinh nhãn ảnh Markdown. Việc xuất ảnh được đảm nhiệm
     bởi một bộ trích xuất riêng biệt có khả năng lưu file ảnh PDF thực tế.
     """

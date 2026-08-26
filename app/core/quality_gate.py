@@ -336,10 +336,11 @@ def _detect_hallucination_and_repetition(markdown: str) -> list[str]:
     if longest_duplicate_run >= 3:
         errors.append("repetition_loop")
 
-    # 2. Phát hiện lặp từ liên tiếp trong 1 dòng (> 4 từ giống nhau)
+    # 2. Phát hiện lặp từ hoặc cụm từ liên tiếp trong 1 dòng (> 3 lần lặp)
     for line in lines:
         words = re.findall(r"[a-zA-ZÀ-ỹĐđ0-9]+", line)
-        if len(words) >= 8:
+        if len(words) >= 6:
+            # Kiểm tra lặp từ đơn
             consec = 0
             prev_w = ""
             for w in words:
@@ -351,6 +352,23 @@ def _detect_hallucination_and_repetition(markdown: str) -> list[str]:
                 else:
                     consec = 0
                 prev_w = w
+
+            # Kiểm tra lặp cụm từ n-gram (2 đến 10 từ)
+            norm_words = [w.casefold() for w in words]
+            for n in range(2, min(11, len(norm_words) // 3 + 1)):
+                for i in range(len(norm_words) - 3 * n + 1):
+                    ngram = norm_words[i:i + n]
+                    repeats = 1
+                    while (
+                        i + (repeats + 1) * n <= len(norm_words)
+                        and norm_words[i + repeats * n:i + (repeats + 1) * n] == ngram
+                    ):
+                        repeats += 1
+                    if repeats >= 3:
+                        errors.append("repetition_loop")
+                        break
+                if "repetition_loop" in errors:
+                    break
     return list(dict.fromkeys(errors))
 
 

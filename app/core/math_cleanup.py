@@ -81,11 +81,11 @@ def math_quality_errors(text: str) -> list[str]:
             errors.append("prose_inside_math")
         if re.fullmatch(r"\s*(?:[A-D]\.|[.,;:!?-]+)\s*", inner):
             errors.append("non_math_math_block")
-        
+
         # Kiểm tra cân bằng ngoặc nhọn trong công thức LaTeX
         if inner.count("{") != inner.count("}"):
             errors.append("unbalanced_latex_braces")
-            
+
         # Kiểm tra các lệnh phân số \frac hoặc căn thức \sqrt chưa hoàn thành
         if re.search(r"\\(?:frac|sqrt)\s*$", inner) or re.search(r"\\frac\s*\{[^{}]*\}\s*$", inner):
             errors.append("incomplete_latex_command")

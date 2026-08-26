@@ -35,7 +35,7 @@ if not pdf.is_file():
 
 with tempfile.TemporaryDirectory() as tmp:
     print(f"[*] Đang chuyển đổi các trang PDF thành ảnh (DPI=200)...", flush=True)
-    
+
     for page_number, image_path in render_pdf(
         pdf,
         tmp,
@@ -44,13 +44,13 @@ with tempfile.TemporaryDirectory() as tmp:
         print(f"\n[+] Đang xử lý Trang {page_number}...", flush=True)
         print(f"    - Đường dẫn ảnh tạm: {image_path}", flush=True)
         print(f"    - Đang thực hiện OCR bằng Qwen (Ollama)...", flush=True)
-        
+
         started_at = perf_counter()
         markdown = engine.ocr_image(
             image_path
         )
         elapsed = perf_counter() - started_at
-        
+
         print(f"    - Hoàn tất OCR trang {page_number} trong {elapsed:.1f} giây. Kết quả:\n", flush=True)
         print("--- KẾT QUẢ ---")
         print(markdown)

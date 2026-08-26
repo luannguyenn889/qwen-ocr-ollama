@@ -64,7 +64,7 @@ def ocr_pdf(
 
     print(f"[1/3] PDF đầu vào: {pdf_path}", flush=True)
     print(f"      Kích thước: {pdf_path.stat().st_size:,} bytes", flush=True)
-    
+
     # Phân loại trang: trang nào có text sẵn, trang nào cần OCR
     native_pages: dict[int, str] = {}
     ocr_page_numbers: set[int] = set()
@@ -84,12 +84,12 @@ def ocr_pdf(
         f"[2/3] Text layer: {len(native_pages)} trang; OCR fallback: {len(ocr_page_numbers)} trang.",
         flush=True,
     )
-    
+
     # Kiểm tra kết nối engine trước khi thực hiện OCR các trang cần thiết
     if ocr_page_numbers:
         print("      Đang kiểm tra kết nối Ollama...", flush=True)
         engine.check_connection()
-        
+
     print(f"[3/3] Đang xuất Markdown (OCR fallback DPI={dpi})...", flush=True)
     document_started_at = perf_counter()
 

@@ -210,6 +210,24 @@ class BlankPageDetectionTests(unittest.TestCase):
             path.write_bytes(b"bad")
             self.assertEqual(classify_page_image(path)[0], "uncertain")
 
+    def test_is_blank_ocr_response_catches_meta_explanation(self):
+        from app.core.batch_ocr import is_blank_ocr_response
+        sample_meta = (
+            "The image provided is a scanned document page that appears to be mostly blank, "
+            "with no visible text or content except for faint red ink stamps and possibly some "
+            "very faint, illegible handwriting at the bottom. According to your strict OCR-only rules — particularly:\n\n"
+            "> “Transcribe only text that is visibly present in the image. Never answer questions, solve exercises, write essays, continue incomplete passages, infer an answer key, summarize, explain, or add any new content.”\n"
+            "> “If the page contains no visible document content, return an empty response.”\n"
+            "> “Do not describe the blank page and do not explain that there is nothing to transcribe.”\n\n"
+            "—and given that:\n\n"
+            "- There are **no clearly readable words** in the image.\n"
+            "- The red stamps contain **illegible or reversed text** (e.g., one stamp reads “10HAY” but appears mirrored/rotated; another has unreadable circular text).\n"
+            "- Any faint handwriting at the bottom is too indistinct to be transcribed accurately without guessing — which violates your rule against inferring or completing text.\n\n"
+            "Therefore, per your absolute priority rule:\n\n"
+            "**Empty response.**"
+        )
+        self.assertTrue(is_blank_ocr_response(sample_meta))
+
 
 if __name__ == "__main__":
     unittest.main()

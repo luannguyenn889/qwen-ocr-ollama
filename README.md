@@ -15,8 +15,10 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
    * Ảnh phân loại được thu tạm xuống tối đa 1024 px với `num_ctx=4096`; nếu vẫn vượt context, hệ thống thử lại một lần ở 768 px rồi giữ ảnh nếu chưa phân loại được.
    * Chỉ gộp ảnh trùng khi dữ liệu tệp giống hoàn toàn; ảnh gần giống hoặc chưa chắc chắn vẫn được giữ.
 2. **Gộp bảng thông minh qua ranh giới trang (Smart Table Merger)**:
-   * Tự động phát hiện và gộp các bảng Markdown bị phân cắt qua ranh giới trang (ví dụ bảng kéo dài từ trang trước sang trang sau).
-   * Loại bỏ các dòng tiêu đề trùng lặp và khoảng trắng thừa, hợp nhất dữ liệu thành một bảng lớn duy nhất chuẩn Markdown.
+   * Tự động phát hiện và gộp các bảng Markdown / HTML bị ngắt đoạn qua ranh giới trang (ví dụ bảng biểu kéo dài nhiều trang).
+   * **Hỗ trợ chuỗi STT phân cấp**: Tự động nhận diện chuỗi thứ tự nhiều tầng (như `4.1, 4.2` $\rightarrow$ `4.3`, `1.2.1` $\rightarrow$ `1.2.2`, `A, B` $\rightarrow$ `C`, `I, II` $\rightarrow$ `III`) để nối dữ liệu chính xác.
+   * **Chuẩn hóa Header & Cột**: Làm phẳng tiêu đề phân cấp đa tầng (flatten headers) và đảm bảo số lượng cột cố định $N$, chống lệch ô/lệch cột khi xuất Markdown.
+   * **Khử lặp Header tự động**: Gỡ bỏ các dòng header trùng lặp, thẻ `<thead>` và `<tr><th>` lặp lại giữa các trang, hợp nhất dữ liệu liền mạch.
 3. **Render và công thức**:
    * CLI và GUI render trang OCR ở **300 DPI**; trang có bảng luôn dùng ảnh toàn trang để giữ cấu trúc hàng/cột.
    * LaTeX-OCR là thành phần tùy chọn; khi không khả dụng, Qwen tiếp tục nhận dạng công thức.
@@ -58,6 +60,16 @@ Dự án sử dụng mô hình thị giác **Qwen** chạy local qua **Ollama** 
    * Không tự sửa lỗi chính tả vốn được in trên tài liệu. Nếu không chắc chắn, hệ thống giữ kết quả OCR đầu tiên.
 8. **Phân loại chuyên ngành có kiểm soát**:
    * Không dùng danh sách từ khóa để ép tài liệu vào một loại cố định.
+9. **Xử lý toàn diện Hard Set (Biểu mẫu, Trắc nghiệm, Chữ viết tay & Ký hiệu)**:
+   * **Checkbox & Tasklist**: Nhận diện chính xác ô tích `- [x]` và ô trống `- [ ]` trên biểu mẫu, tự động chuẩn hóa các ký tự `[v]`, `[V]`, `[*]`, `☑`, `☐`.
+   * **Đáp án trắc nghiệm khoanh tròn**: Chuyển đổi đáp án được khoanh/đánh dấu thành in đậm định dạng Markdown `**(A)**`, `**(B)**`, `**(C)**`, `**(D)**`.
+   * **Chữ viết tay sửa đổi & Gạch xóa**: Nhận diện thao tác gạch bỏ trên văn bản và giữ dưới dạng strikethrough `~~nội dung bị gạch~~`.
+   * **Ký hiệu đo lường, pháp lý & toán học**: Chuẩn hóa chính xác các ký hiệu `°C`, `×`, `µ`, `±`, `≤`, `≥`, `≈`, `©`, `®`, `™`, `m²`, `m³` theo chuẩn Unicode.
+10. **Khử vòng lặp ảo giác đa cấp (Multi-level Hallucination Loop Suppression)**:
+    * **Trong cùng một dòng**: Thuật toán `collapse_inline_repetitions` tự động phát hiện và cắt tỉa các cụm từ N-gram (2–10 từ) bị lặp $\ge 3$ lần, đồng thời gọt sạch các đoạn đuôi bị cụt dở.
+    * **Chốt chặn Quality Gate**: Phát hiện các chuỗi lặp bất thường và tự động kích hoạt `REPETITION_RETRY_INSTRUCTION` yêu cầu AI đọc lại toàn trang với lệnh cấm lặp.
+11. **Chuẩn hóa đường dẫn ảnh chuẩn CommonMark**:
+    * Mọi thẻ hình ảnh `![alt](...)` có chứa khoảng trắng hoặc ký tự tiếng Việt có dấu được tự động bọc bằng cặp ngoặc nhọn `<images/...>` theo đúng chuẩn CommonMark 0.30, hiển thị mượt mà 100% trên VS Code Preview, Obsidian và GitHub.
 
 ---
 
@@ -297,6 +309,7 @@ qwen-ocr-ollama/
 │   │   ├── formula_ocr.py      # Nhận diện công thức tùy chọn bằng LaTeX-OCR
 │   │   ├── image_grounded_review.py # Phát hiện ứng viên, crop tạm và xác minh lại bằng ảnh
 │   │   ├── layout_detector.py  # PaddleOCR layout, cột, bảng, ảnh và overlay
+│   │   ├── markdown_normalizer.py # Chuẩn hóa cấu trúc Markdown, khử lặp từ, sửa đường dẫn ảnh
 │   │   ├── math_cleanup.py     # Chuẩn hóa và kiểm tra cấu trúc LaTeX/đáp án
 │   │   ├── ocr_metrics.py      # Chỉ số đánh giá kết quả OCR/Markdown
 │   │   ├── ocr_validator.py    # Kiểm tra tính hợp lệ của Markdown đầu ra

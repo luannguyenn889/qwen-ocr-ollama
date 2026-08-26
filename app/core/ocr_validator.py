@@ -154,7 +154,7 @@ def main():
 
     validator = OCRValidator()
     print(f"Đang kiểm định {len(files_to_check)} tệp markdown...\n")
-    
+
     any_errors = False
     for file in files_to_check:
         res = validator.validate_file(file)
@@ -172,10 +172,10 @@ def main():
                     print(f"    - {err}")
                 errors_found = True
                 any_errors = True
-        
+
         if not errors_found:
             print("  [OK] Không phát hiện lỗi.")
-            
+
     if any_errors:
         sys.exit(1)
     else:

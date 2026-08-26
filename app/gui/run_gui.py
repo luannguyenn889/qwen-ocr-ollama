@@ -1,13 +1,15 @@
 """
 Module: run_gui.py
 Nhiệm vụ: Giao diện đồ họa (GUI) quản lý tiến trình OCR tài liệu PDF sử dụng Tkinter.
-Quy trình: 
+Quy trình:
   1. Cho phép người dùng chọn tệp tin PDF hoặc thư mục chứa các tệp PDF.
   2. Bắt đầu/Dừng (Start/Stop) tiến trình OCR thông qua luồng chạy ngầm (Threading).
   3. Hiển thị tiến trình chi tiết của file, số trang hiện tại kèm thanh tiến trình ASCII và nhật ký (Log) thời gian thực.
 """
 
 import os
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 import threading
 import queue
 import tempfile
@@ -27,16 +29,16 @@ warnings.filterwarnings(
 )
 
 # pyrefly: ignore [missing-import]
-from PIL import Image, ImageTk 
+from PIL import Image, ImageTk
 # pyrefly: ignore [missing-import]
-import pymupdf  # PyMuPDF 
+import pymupdf  # PyMuPDF
 # pyrefly: ignore [missing-import]
 from ollama import Client
 from app.core.batch_ocr import (
     ENABLE_LAYOUT_DETECTION, MODEL, OLLAMA_REQUEST_TIMEOUT_SECONDS, PROMPT as CORE_PROMPT,
     TABLE_HTML_RETRY_INSTRUCTION, TABLE_RENDER_DPI, TABLE_SAFE_INSTRUCTION,
     TABLE_STRUCTURE_REPAIR_PROMPT, clean_markdown as core_clean_markdown,
-    TEXT_ONLY_OUTPUT,
+    TEXT_ONLY_OUTPUT, warmup_qwen_model,
     QUALITY_RETRY_INSTRUCTION, apply_page_assets, classify_graphic_crop,
     cleanup_unreferenced_assets, deduplicate_exact_assets, quality_retry_instruction,
     extract_images_from_page as core_extract_images_from_page,
@@ -55,98 +57,11 @@ from tkinter.scrolledtext import ScrolledText
 
 PROMPT = CORE_PROMPT
 
-def merge_markdown_tables(markdown_text: str) -> str:
-    return core_merge_markdown_tables(markdown_text)
-
-def clean_markdown(text: str) -> str:
-    text = text.strip()
-    if is_blank_ocr_response(text):
-        return ""
-    text = re.sub(r"^```[a-zA-Z0-9_-]*\s*\r?\n?", "", text)
-    text = re.sub(r"\r?\n?```\s*$", "", text)
-    text = text.strip()
-
-    # Remove a model acknowledgement before the actual document Markdown.
-    text = re.sub(
-        r"\A(?:based on (?:your|the) requirements|here (?:is|are) (?:the )?(?:converted|extracted|requested)|dưới đây là).+?(?:\r?\n){2,}",
-        "",
-        text,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    def unwrap_prose_math(match):
-        content = match.group(1)
-        words = content.split()
-        math_operators = len(re.findall(r"[=+*/^_{}\\]", content))
-        if len(words) >= 6 and math_operators <= 2:
-            return content
-        return match.group(0)
-
-    return re.sub(r"(?<!\$)\$([^$\n]+)\$(?!\$)", unwrap_prose_math, text)
-
-def post_process_markdown(text: str) -> str:
-    # 1. Clean HTML entities like &nbsp; and duplicate spaces
-    text = re.sub(r'&(?:nbsp|amp);', ' ', text)
-    text = re.sub(
-        r"(?<!\$)\$([^$\n]+)\$(?!\$)",
-        lambda match: match.group(1)
-        if len(match.group(1).split()) >= 6
-        and len(re.findall(r"[=+*/^_{}\\]", match.group(1))) <= 2
-        else match.group(0),
-        text,
-    )
-    
-    processed_lines = []
-    for line in text.splitlines():
-        # 2. Fix merged math blocks that span across option transitions (e.g. A. $expr1 B. expr2$)
-        # This split logic checks if a math block contains option transitions and breaks it up generically.
-        def split_merged_math(match):
-            content = match.group(1)
-            # Find occurrences of standard uppercase list/option labels followed by a dot or parenthesis,
-            # e.g., " B. ", " C. ", " 2) ", " b. "
-            opt_transition = re.search(r'\s+([A-Za-z0-9])[\.\)]\s+', content)
-            if opt_transition:
-                # Split at option labels to keep math expressions separated
-                parts = re.split(r'(\s+[A-Za-z0-9][\.\)]\s+)', content)
-                new_parts = []
-                for i, part in enumerate(parts):
-                    if i % 2 == 0:
-                        part_stripped = part.strip()
-                        if part_stripped:
-                            new_parts.append(f"${part_stripped}$")
-                    else:
-                        new_parts.append(part)
-                return "".join(new_parts)
-            return match.group(0)
-            
-        line = re.sub(r'(?<!\\)\$(.*?)(?<!\\)\$', split_merged_math, line)
-        
-        # 3. Balance unescaped dollar signs on each line
-        # If there's an odd number of dollar signs, close the last one at the end of the line (before punctuation)
-        dollar_indices = [i for i, char in enumerate(line) if char == '$' and (i == 0 or line[i-1] != '\\')]
-        if len(dollar_indices) % 2 != 0:
-            line_stripped = line.rstrip()
-            if line_stripped.endswith('.'):
-                line = line_stripped[:-1] + '$.'
-            else:
-                line = line_stripped + '$'
-                
-        processed_lines.append(line)
-        
-    result = "\n".join(processed_lines)
-    return re.sub(
-        r"(?<!\$)\$([^$\n]+)\$(?!\$)",
-        lambda match: match.group(1)
-        if len(match.group(1).split()) >= 6
-        and len(re.findall(r"[=+*/^_{}\\]", match.group(1))) <= 2
-        else match.group(0),
-        result,
-    )
-
-
-# The desktop frontend delegates OCR helpers to the core pipeline.
+# The desktop frontend delegates OCR helpers and cleaning to the core pipeline.
+merge_markdown_tables = core_merge_markdown_tables
 extract_images_from_page = core_extract_images_from_page
 clean_markdown = core_clean_markdown
+
 
 
 def format_elapsed(seconds: float) -> str:
@@ -174,6 +89,7 @@ class OCRWorker:
         stop_event: threading.Event, resume_event: threading.Event,
         model_name: str, workers: int = 1, skip_blank_pages: bool = True,
         blank_detection_sensitivity: str = "safe",
+        spell_correct: bool = False,
     ):
         self.workers = normalize_worker_count(workers, model_name)
         self.layout_lock = threading.Lock()
@@ -189,6 +105,7 @@ class OCRWorker:
         self.blank_detection_sensitivity = normalize_blank_detection_sensitivity(
             blank_detection_sensitivity
         )
+        self.spell_correct = bool(spell_correct)
         self.client = Client(
             host="http://localhost:11434", timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
         )
@@ -208,7 +125,7 @@ class OCRWorker:
                 pdf_files.append(self.target_path)
             elif self.target_path.is_dir():
                 pdf_files = sorted(list(self.target_path.glob("*.pdf")))
-                
+
             if not pdf_files:
                 self.progress_queue.put(("log", "Lỗi: Không tìm thấy file PDF nào để xử lý.\n"))
                 self.progress_queue.put(("finished", "no_files"))
@@ -231,24 +148,24 @@ class OCRWorker:
                 pdf_start_time = time.perf_counter()
                 if self.stop_event.is_set():
                     break
-                
+
                 self.progress_queue.put(("file_progress", (file_idx - 1, total_files, pdf_path.name)))
                 self.progress_queue.put(("stage_status", "OCR"))
                 self.progress_queue.put(("log", f"\n[File {file_idx}/{total_files}] Đang xử lý: {pdf_path.name}\n"))
-                
+
                 # Tạo thư mục đầu ra
                 self.output_dir.mkdir(parents=True, exist_ok=True)
                 output_path = output_markdown_path(self.output_dir, pdf_path)
-                
+
                 # Render các trang PDF thành ảnh
                 with tempfile.TemporaryDirectory() as temp_dir:
                     temp_dir_path = Path(temp_dir)
-                    
+
                     self.progress_queue.put(("log", "  - Đang render PDF thành hình ảnh (300 DPI)...\n"))
                     doc = pymupdf.open(pdf_path)
                     total_pages = len(doc)
                     self.progress_queue.put(("page_progress", (0, total_pages)))
-                    
+
                     page_images = []
                     render_timings = []
                     blank_pages = set()
@@ -297,7 +214,7 @@ class OCRWorker:
                                     f"{int(metrics.get('vertical_rules', 0))})\n",
                                 ))
                     doc.close()
-                    
+
                     if self.stop_event.is_set():
                         break
 
@@ -322,11 +239,11 @@ class OCRWorker:
                         idx, img_path = args
                         if self.stop_event.is_set():
                             return None
-                        
+
                         page_num = idx + 1
                         selected_model = hybrid_model if is_hybrid else resolve_qwen_model(self.model_name)
                         self.progress_queue.put(("log", f"  - Đang OCR Trang {page_num}/{total_pages}...\n"))
-                        
+
                         started_at = time.perf_counter()
                         self.progress_queue.put(("page_timer_start", (page_num, started_at)))
                         paddle_seconds = 0.0
@@ -464,7 +381,7 @@ class OCRWorker:
                                     "page_progress", (self.pages_processed, total_pages)
                                 ))
                             return (page_num, "")
-                        
+
                         if extracted_paths:
                             self.progress_queue.put(("log", f"    -> Đã trích xuất {len(extracted_paths)} hình ảnh từ PDF trang {page_num}.\n"))
                         if not assets_applied:
@@ -538,7 +455,7 @@ class OCRWorker:
                         elapsed = time.perf_counter() - started_at
                         self.progress_queue.put(("log", f"    Benchmark: Render {render_timings[idx]:.1f}s | Layout {paddle_seconds:.1f}s | Qwen lần đầu {qwen_first_seconds:.1f}s | Retry {retry_seconds:.1f}s | Formula OCR 0.0s\n"))
                         self.progress_queue.put(("log", f"    -> Hoàn thành Trang {page_num} ({elapsed:.1f} giây)\n"))
-                        
+
                         with self.progress_lock:
                             self.pages_processed = getattr(self, "pages_processed", 0) + 1
                             pages_done = self.pages_processed
@@ -546,7 +463,7 @@ class OCRWorker:
                                 import gc
                                 gc.collect()
                                 self.progress_queue.put(("log", f"    -> [Memory] Đã dọn rác RAM sau {pages_done} trang.\n"))
-                            
+
                             elapsed_total = time.perf_counter() - pdf_start_time
                             avg_time = elapsed_total / pages_done
                             remaining_pages = total_pages - pages_done
@@ -566,7 +483,7 @@ class OCRWorker:
                                     mapped_markdown, page_md, current_block_spans,
                                 )
                             page_block_spans[page_num] = current_block_spans
-                        
+
                         return (page_num, page_md)
 
                     import concurrent.futures
@@ -591,12 +508,12 @@ class OCRWorker:
                                 self.progress_queue.put(("page_timer_end", page_num))
                             )
                             futures.append(future)
-                        
+
                         for future in concurrent.futures.as_completed(futures):
                             res = future.result()
                             if res is not None:
                                 results.append(res)
-                    
+
                     results.sort(key=lambda x: x[0])
                     self.progress_queue.put(("stage_status", "Hậu kiểm ảnh"))
                     self.progress_queue.put(("stage_progress", 94))
@@ -629,21 +546,23 @@ class OCRWorker:
                     page_quality = validate_page_numbers([page_num for page_num, _ in results], total_pages)
                     if not page_quality.passed and not self.stop_event.is_set():
                         raise RuntimeError("Thiếu trang trước khi lưu: " + ", ".join(page_quality.errors))
-                    
+
                     for page_num, page_md in results:
                         if page_md and page_md.strip():
                             ocr_contents.append(f"<!-- Page {page_num} -->\n\n{page_md}")
-                    
+
                     if self.stop_event.is_set():
                         break
-                        
+
                     # Save results
                     self.progress_queue.put(("stage_status", "Lưu kết quả"))
                     self.progress_queue.put(("stage_progress", 98))
                     final_md = "\n\n".join(ocr_contents) + "\n"
                     finalization_report = {"spelling_warnings": []}
                     try:
-                        final_md, finalization_report = finalize_markdown(final_md, return_report=True)
+                        final_md, finalization_report = finalize_markdown(
+                            final_md, return_report=True, spell_correct=self.spell_correct
+                        )
                         self.progress_queue.put(("log", "  - Hậu xử lý Markdown:\n"))
                         for report_line in format_finalization_report(finalization_report):
                             self.progress_queue.put(("log", f"    + {report_line}\n"))
@@ -669,7 +588,7 @@ class OCRWorker:
                     ))
                     file_elapsed = time.perf_counter() - pdf_start_time
                     self.progress_queue.put(("log", f"  - Tổng thời gian OCR file: {format_elapsed(file_elapsed)}\n"))
-            
+
             if self.stop_event.is_set():
                 batch_elapsed = time.perf_counter() - batch_start_time
                 self.progress_queue.put(("log", f"\n[DỪNG] Tiến trình đã bị hủy bởi người dùng sau {format_elapsed(batch_elapsed)}.\n"))
@@ -690,7 +609,7 @@ class AppGUI:
         self.root.title("Qwen OCR Pipeline & Manager")
         self.root.geometry("1200x900")
         self.root.minsize(900, 700)
-        
+
         self.progress_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.resume_event = threading.Event()
@@ -702,7 +621,7 @@ class AppGUI:
         self._preview_images: list[ImageTk.PhotoImage] = []
         self.latest_overlay_path: Path | None = None
         self._inline_overlay_image: ImageTk.PhotoImage | None = None
-        
+
         self.create_styles()
         self.build_ui()
         self.root.after(100, self.poll_queue)
@@ -710,7 +629,7 @@ class AppGUI:
     def create_styles(self):
         style = ttk.Style()
         style.theme_use("clam")
-        
+
         # Dark premium theme styling
         style.configure(".", background="#f5f6f8", foreground="#333333", font=("Segoe UI", 10))
         style.configure("TFrame", background="#f5f6f8")
@@ -726,33 +645,33 @@ class AppGUI:
         # Main layout frame
         main_frame = ttk.Frame(self.root, padding=12)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         # Header Label
         header_lbl = ttk.Label(main_frame, text="Qwen OCR Document Pipeline", style="Header.TLabel")
         header_lbl.pack(anchor=tk.W, pady=(0, 8))
-        
+
         # 1. File Selection Frame
         selection_frame = ttk.LabelFrame(main_frame, text=" Chọn tài liệu đầu vào ", padding=10)
         selection_frame.pack(fill=tk.X, pady=(0, 8))
-        
+
         self.path_var = tk.StringVar()
         path_entry = ttk.Entry(selection_frame, textvariable=self.path_var, font=("Segoe UI", 10))
         path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        
+
         btn_file = ttk.Button(selection_frame, text="Chọn PDF...", command=self.browse_file, style="Action.TButton")
         btn_file.pack(side=tk.LEFT, padx=2)
-        
+
         btn_dir = ttk.Button(selection_frame, text="Chọn thư mục...", command=self.browse_directory, style="Action.TButton")
         btn_dir.pack(side=tk.LEFT, padx=2)
 
         # 2. Output Directory Frame
         out_frame = ttk.LabelFrame(main_frame, text=" Thư mục đầu ra ", padding=10)
         out_frame.pack(fill=tk.X, pady=(0, 8))
-        
+
         self.out_var = tk.StringVar(value=str(Path("OCR").resolve()))
         out_entry = ttk.Entry(out_frame, textvariable=self.out_var, font=("Segoe UI", 10))
         out_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        
+
         btn_out = ttk.Button(out_frame, text="Thay đổi...", command=self.browse_output, style="Action.TButton")
         btn_out.pack(side=tk.LEFT)
 
@@ -819,38 +738,44 @@ class AppGUI:
             font=("Segoe UI", 10),
         ).pack(side=tk.LEFT)
 
+        self.spell_correct_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            model_frame, text="Sửa chính tả",
+            variable=self.spell_correct_var,
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
 
         # 4. Status & Progress Indicators
         progress_frame = ttk.LabelFrame(main_frame, text=" Tiến trình ", padding=10)
         progress_frame.pack(fill=tk.X, pady=(0, 8))
-        
+
         self.file_progress_var = tk.StringVar(value="File: Sẵn sàng")
         self.file_lbl = ttk.Label(progress_frame, textvariable=self.file_progress_var, style="Status.TLabel")
         self.file_lbl.pack(anchor=tk.W, pady=2)
-        
+
         self.file_progressbar = ttk.Progressbar(progress_frame, mode="determinate")
         self.file_progressbar.pack(fill=tk.X, pady=(2, 8))
-        
+
         self.page_progress_var = tk.StringVar(value="Trang: Sẵn sàng")
         self.page_lbl = ttk.Label(progress_frame, textvariable=self.page_progress_var, style="Status.TLabel")
         self.page_lbl.pack(anchor=tk.W, pady=2)
-        
+
         self.page_progressbar = ttk.Progressbar(progress_frame, mode="determinate")
         self.page_progressbar.pack(fill=tk.X, pady=(2, 5))
 
         # Thống kê tổng hợp (Summary Dashboard)
         stats_frame = ttk.LabelFrame(main_frame, text=" Thống kê tổng hợp ", padding=10)
         stats_frame.pack(fill=tk.X, pady=(0, 8))
-        
+
         self.stats_avg_var = tk.StringVar(value="Trung bình: -- s/trang")
         ttk.Label(stats_frame, textvariable=self.stats_avg_var).pack(side=tk.LEFT, expand=True)
-        
+
         self.stats_eta_var = tk.StringVar(value="ETA: Đang tính toán...")
         ttk.Label(stats_frame, textvariable=self.stats_eta_var).pack(side=tk.LEFT, expand=True)
 
         self.stats_active_var = tk.StringVar(value="Đang OCR: --")
         ttk.Label(stats_frame, textvariable=self.stats_active_var).pack(side=tk.LEFT, expand=True)
-        
+
         self.stats_warn_var = tk.StringVar(value="Cảnh báo: 0")
         ttk.Label(stats_frame, textvariable=self.stats_warn_var, foreground="red").pack(side=tk.LEFT, expand=True)
 
@@ -860,13 +785,13 @@ class AppGUI:
         action_frame.columnconfigure(0, weight=2)
         action_frame.columnconfigure(1, weight=1)
         action_frame.columnconfigure(2, weight=1)
-        
+
         self.btn_start = ttk.Button(action_frame, text="Bắt đầu OCR", style="Start.TButton", command=self.start_ocr)
         self.btn_start.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        
+
         self.btn_pause = ttk.Button(action_frame, text="Tạm dừng", style="Action.TButton", command=self.toggle_pause, state=tk.DISABLED)
         self.btn_pause.grid(row=0, column=1, sticky="ew", padx=(0, 10))
-        
+
         self.btn_stop = ttk.Button(action_frame, text="Dừng lại", style="Stop.TButton", command=self.stop_ocr, state=tk.DISABLED)
         self.btn_stop.grid(row=0, column=2, sticky="ew")
 
@@ -913,7 +838,17 @@ class AppGUI:
         )
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text.insert(tk.END, "Chào mừng đến với Qwen OCR Manager. Vui lòng chọn file PDF để bắt đầu.\n")
-        
+
+        # Khởi động trước (Warm-up) model trên VRAM ở luồng ngầm
+        def _startup_warmup():
+            try:
+                m_name = resolve_qwen_model(self.model_var.get().strip() or MODEL)
+                client = Client(host="http://localhost:11434", timeout=15.0)
+                warmup_qwen_model(client, m_name, keep_alive="30m")
+            except Exception:
+                pass
+        threading.Thread(target=_startup_warmup, daemon=True).start()
+
     def browse_file(self):
         filename = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
         if filename:
@@ -1084,16 +1019,16 @@ class AppGUI:
     def start_ocr(self):
         target = self.path_var.get().strip()
         output = self.out_var.get().strip()
-        
+
         if not target:
             messagebox.showwarning("Cảnh báo", "Vui lòng chọn tệp PDF hoặc thư mục chứa PDF.")
             return
-            
+
         target_path = Path(target)
         if not target_path.exists():
             messagebox.showerror("Lỗi", "Đường dẫn đầu vào không tồn tại.")
             return
-            
+
         self.btn_start.configure(state=tk.DISABLED)
         self.btn_stop.configure(state=tk.NORMAL)
         self.btn_pause.configure(state=tk.NORMAL, text="Tạm dừng")
@@ -1102,13 +1037,13 @@ class AppGUI:
         self.resume_event.set()
         self.active_page_timers = {}
         self.stats_active_var.set("Đang OCR: đang chuẩn bị...")
-        
+
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert(tk.END, "Đang khởi tạo...\n")
         self.log_text.see(tk.END)
-        
+
         self.stop_event.clear()
-        
+
         model_name = self.model_var.get().strip() or MODEL
         self.log_text.insert(tk.END, f"Mô hình được chọn: {model_name}\n")
         resolved_model = resolve_qwen_model(model_name)
@@ -1125,6 +1060,10 @@ class AppGUI:
             blank_detection_sensitivity=(
                 self.blank_sensitivity_var.get()
                 if hasattr(self, "blank_sensitivity_var") else "safe"
+            ),
+            spell_correct=(
+                self.spell_correct_var.get()
+                if hasattr(self, "spell_correct_var") else False
             ),
         )
         self.worker_thread = threading.Thread(target=worker.run, daemon=True)
@@ -1223,7 +1162,7 @@ class AppGUI:
                         self.page_progressbar["value"] = 0
                     self.file_progress_var.set("File: Xong")
                     self.page_progress_var.set("Trang: Xong")
-                    
+
                     if data == "completed":
                         messagebox.showinfo("Thông báo", "Quá trình OCR đã hoàn thành thành công!")
                     elif data == "cancelled":

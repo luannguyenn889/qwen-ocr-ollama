@@ -42,13 +42,41 @@ class VietnameseSpellCorrectorTests(unittest.TestCase):
         text = "<table><tr><td><table><tr><td>nghien cuu</td></tr></table></td></tr></table>"
         self.assertEqual(correct_vietnamese_spelling(text), (text, 0))
 
-    def test_masks_pipe_table(self):
-        text = "| Nội dung |\n|---|\n| nghien cuu |"
-        self.assertEqual(correct_vietnamese_spelling(text), (text, 0))
+    def test_corrects_pipe_table_text_cells_while_masking_numbers(self):
+        text = "| STT | Nội dung | Số lượng |\n|:---|:---|:---|\n| 1.1 | Số van ban chi dao CCHC | 19 |"
+        corrected, count = correct_vietnamese_spelling(text)
+        self.assertIn("văn bản", corrected)
+        self.assertIn("chỉ đạo", corrected)
+        self.assertIn("| 1.1 |", corrected)
+        self.assertIn("| 19 |", corrected)
 
     def test_does_not_join_context_across_paragraphs(self):
         text = "nghien\n\ncuu"
         self.assertEqual(correct_vietnamese_spelling(text), (text, 0))
+
+    def test_corrects_administrative_terms(self):
+        text = "Thuc hien thu tuc hanh chinh va quy pham phap luat."
+        corrected, count = correct_vietnamese_spelling(text)
+        self.assertIn("thủ tục hành chính", corrected)
+        self.assertIn("quy phạm pháp luật", corrected)
+        self.assertGreater(count, 0)
+
+    def test_corrects_trigram_context(self):
+        text = "Số người đã tinh giam trong kỳ báo cáo."
+        corrected, count = correct_vietnamese_spelling(text)
+        self.assertIn("tinh giản", corrected)
+        self.assertGreater(count, 0)
+
+    def test_corrects_uppercase_vietnamese_phrase(self):
+        text = "VĂN KIẾN CHƯƠNG TRÌNH QUỐC GIA"
+        corrected, count = correct_vietnamese_spelling(text)
+        self.assertIn("VĂN KIỆN CHƯƠNG TRÌNH QUỐC GIA", corrected)
+
+    def test_deduplicates_repeated_function_words(self):
+        text = "xây dựng các các chương trình và và kế hoạch"
+        corrected, count = correct_vietnamese_spelling(text)
+        self.assertEqual(corrected, "xây dựng các chương trình và kế hoạch")
+        self.assertGreater(count, 0)
 
 
 if __name__ == "__main__":
