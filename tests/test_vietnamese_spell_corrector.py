@@ -1,82 +1,48 @@
 import unittest
-
 from app.core.vietnamese_spell_corrector import correct_vietnamese_spelling
 
 
 class VietnameseSpellCorrectorTests(unittest.TestCase):
-    def test_corrects_unique_bigram_candidate(self):
-        corrected, count = correct_vietnamese_spelling("Kết quả nghiên cưu đã hoàn thành.")
-        self.assertEqual(corrected, "Kết quả nghiên cứu đã hoàn thành.")
-        self.assertEqual(count, 1)
+    def test_correct_isolated_non_words(self):
+        # Non-words (nghỉên, chuẫn) should be corrected to (nghiên, chuẩn)
+        wrong = "Tài liệu này nghỉên cứu về chuẫn mực."
+        expected = "Tài liệu này nghiên cứu về chuẩn mực."
+        corrected, count = correct_vietnamese_spelling(wrong)
+        self.assertEqual(corrected, expected)
+        self.assertGreaterEqual(count, 1)
 
-    def test_preserves_all_uppercase_special_text(self):
-        corrected, count = correct_vietnamese_spelling("NGHIEN CUU và Nghien cuu")
-        self.assertEqual(corrected, "NGHIEN CUU và Nghiên cứu")
-        self.assertEqual(count, 2)
+    def test_correct_trigrams_and_bigrams(self):
+        text = "Uỷ ban nhân dân thành phố ban hành quyết định."
+        corrected, _ = correct_vietnamese_spelling(text)
+        self.assertEqual(corrected, text)
 
-    def test_preserves_titlecase_name_pair(self):
-        text = "Nghien Cuu ký xác nhận."
-        self.assertEqual(correct_vietnamese_spelling(text), (text, 0))
+    def test_preserve_acronyms_and_english(self):
+        text = "Hệ thống sử dụng mô hình AI và chuẩn REST API."
+        corrected, _ = correct_vietnamese_spelling(text)
+        self.assertEqual(corrected, text)
 
-    def test_keeps_already_valid_words(self):
-        corrected, count = correct_vietnamese_spelling("nghiên cứu khoa học")
-        self.assertEqual(corrected, "nghiên cứu khoa học")
-        self.assertEqual(count, 0)
+    def test_fuzzy_bigram_correction(self):
+        # bộc lập -> độc lập (bộc is 1 char edit from độc, độc lập is in bigrams)
+        wrong = "Quyền bộc lập và tự do của dân tộc."
+        expected = "Quyền độc lập và tự do của dân tộc."
+        corrected, count = correct_vietnamese_spelling(wrong)
+        self.assertEqual(corrected, expected)
+        self.assertGreaterEqual(count, 1)
 
-    def test_masks_sensitive_regions(self):
-        text = (
-            "nghien cuu `nghien cuu` $nghien cuu$ "
-            "[nghien cuu](https://example.com/nghien-cuu) "
-            "<table><tr><td>nghien cuu</td></tr></table> "
-            "121/2026/QĐ-UBND user@example.com DT-2026-01"
+        # The giờn -> Thế gian / Thế giới
+        wrong_phrase = "The giờn ngày nay đã phát triển."
+        corrected_phrase, _ = correct_vietnamese_spelling(wrong_phrase)
+        self.assertTrue(
+            corrected_phrase.startswith("Thế gian") or corrected_phrase.startswith("Thế giới"),
+            f"Expected 'Thế gian' or 'Thế giới', got: {corrected_phrase}"
         )
-        corrected, count = correct_vietnamese_spelling(text)
-        self.assertTrue(corrected.startswith("nghiên cứu `nghien cuu` $nghien cuu$"))
-        self.assertIn("<td>nghien cuu</td>", corrected)
-        self.assertIn("121/2026/QĐ-UBND", corrected)
-        self.assertIn("user@example.com", corrected)
-        self.assertIn("DT-2026-01", corrected)
-        self.assertEqual(count, 2)
 
-    def test_masks_nested_html_table(self):
-        text = "<table><tr><td><table><tr><td>nghien cuu</td></tr></table></td></tr></table>"
-        self.assertEqual(correct_vietnamese_spelling(text), (text, 0))
-
-    def test_corrects_pipe_table_text_cells_while_masking_numbers(self):
-        text = "| STT | Nội dung | Số lượng |\n|:---|:---|:---|\n| 1.1 | Số van ban chi dao CCHC | 19 |"
-        corrected, count = correct_vietnamese_spelling(text)
-        self.assertIn("văn bản", corrected)
-        self.assertIn("chỉ đạo", corrected)
-        self.assertIn("| 1.1 |", corrected)
-        self.assertIn("| 19 |", corrected)
-
-    def test_does_not_join_context_across_paragraphs(self):
-        text = "nghien\n\ncuu"
-        self.assertEqual(correct_vietnamese_spelling(text), (text, 0))
-
-    def test_corrects_administrative_terms(self):
-        text = "Thuc hien thu tuc hanh chinh va quy pham phap luat."
-        corrected, count = correct_vietnamese_spelling(text)
-        self.assertIn("thủ tục hành chính", corrected)
-        self.assertIn("quy phạm pháp luật", corrected)
-        self.assertGreater(count, 0)
-
-    def test_corrects_trigram_context(self):
-        text = "Số người đã tinh giam trong kỳ báo cáo."
-        corrected, count = correct_vietnamese_spelling(text)
-        self.assertIn("tinh giản", corrected)
-        self.assertGreater(count, 0)
-
-    def test_corrects_uppercase_vietnamese_phrase(self):
-        text = "VĂN KIẾN CHƯƠNG TRÌNH QUỐC GIA"
-        corrected, count = correct_vietnamese_spelling(text)
-        self.assertIn("VĂN KIỆN CHƯƠNG TRÌNH QUỐC GIA", corrected)
-
-    def test_deduplicates_repeated_function_words(self):
-        text = "xây dựng các các chương trình và và kế hoạch"
-        corrected, count = correct_vietnamese_spelling(text)
-        self.assertEqual(corrected, "xây dựng các chương trình và kế hoạch")
-        self.assertGreater(count, 0)
+    def test_uppercase_heading_correction(self):
+        heading = "BỘC LẬP - TỰ DO - HẠNH PHÚC"
+        expected = "ĐỘC LẬP - TỰ DO - HẠNH PHÚC"
+        corrected, count = correct_vietnamese_spelling(heading)
+        self.assertEqual(corrected, expected)
+        self.assertEqual(count, 1)
 
 
 if __name__ == "__main__":

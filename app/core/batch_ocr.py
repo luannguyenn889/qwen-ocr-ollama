@@ -2934,6 +2934,13 @@ def process_single_pdf(
                     f"using rendered orientation: {orientation_error}"
                 )
 
+            # Tiền xử lý nâng cao tương phản và khử nền ố vàng/nhiễu cho tài liệu scan
+            try:
+                from app.core.image_preprocessor import enhance_scanned_document
+                enhance_scanned_document(img_path, output_path=img_path)
+            except Exception as enhance_err:
+                pass
+
             page_md = ""
             error = None
             qwen_images = [img_path]
@@ -3340,21 +3347,12 @@ def main():
     elif target_path.is_dir():
         pdf_files = sorted(list(target_path.glob("*.pdf")))
     else:
-        # Tự khởi tạo cấu trúc thư mục PDF nếu rỗng và sao chép dữ liệu mẫu
         target_path.mkdir(parents=True, exist_ok=True)
         pdf_files = list(target_path.glob("*.pdf"))
         if not pdf_files:
-            print(f"Directory {input_path} is empty. Copying sample PDFs for demonstration...")
-            sample_source = Path("samples/pdfs/test.pdf")
-            if sample_source.is_file():
-                import shutil
-                shutil.copy(sample_source, target_path / "A.pdf")
-                shutil.copy(sample_source, target_path / "B.pdf")
-                print("Copied sample PDFs into input directory.")
-                pdf_files = list(target_path.glob("*.pdf"))
-            else:
-                print("No sample PDFs found. Please place PDF files in the input directory.")
-                sys.exit(0)
+            print(f"No PDF files found in directory: {input_path}")
+            print("Please place PDF files in the input directory.")
+            sys.exit(0)
 
     print(f"Found {len(pdf_files)} PDF files to process.")
     print(f"Using model: {args.model}")

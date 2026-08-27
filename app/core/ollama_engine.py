@@ -52,8 +52,13 @@ Hãy tuân thủ các quy tắc định dạng và cấu trúc nghiêm ngặt sa
    - Gạch xóa bút mực: Khi có dòng chữ in bị gạch xóa bằng bút, bao bọc đoạn bị gạch trong cú pháp `~~nội dung bị gạch~~`.
    - Chữ viết tay điền biểu mẫu: Chép chính xác nội dung chữ viết tay tại đúng vị trí điền trên biểu mẫu.
 
-5. Nguyên tắc chung, Ký hiệu & Độ chính xác Dấu Tiếng Việt:
+5. Nguyên tắc chung, Ký hiệu, Danh từ riêng & Dấu Tiếng Việt:
    - Giữ nguyên văn bản gốc, bảo toàn ngôn ngữ (tiếng Việt, tiếng Anh, v.v.) và chính tả.
+   - Danh từ riêng, Từ địa phương & Cấu trúc âm tiết đặc thù:
+     * Tài liệu có thể chứa danh từ riêng, tên địa danh, từ địa phương hoặc tên người dân tộc với các cấu trúc âm tiết ít gặp trong từ điển chuẩn (như các tổ hợp nguyên âm đặc thù, âm đuôi kết thúc bằng `-nh`, `-k`, `-r`, `-p`, `-l`, `-s`, `-ch`).
+     * BẮT BUỘC chép trung thực 100% từng ký tự chữ cái và dấu thanh theo đúng hình ảnh nhìn thấy.
+     * Đặc biệt chú ý phân biệt nét ký tự ở đuôi chữ (như chữ `h` vs `g`, `n` vs `m`, `k` vs `c`, `t` vs `l`).
+     * TUYỆT ĐỐI KHÔNG tự ý sửa từ (autocorrect), không ép về từ vựng phổ thông quen thuộc và không tự thêm/bớt dấu thanh khi ảnh gốc không có.
    - Bảo toàn các ký hiệu đặc biệt, đơn vị đo lường (ví dụ: độ `°C`, kích thước `×`, micro `µ`, cộng trừ `±`, so sánh `≤`, `≥`, `≈`, bản quyền `©`, `®`, `™`, chỉ số `m²`, `m³`, `x₁`).
    - Chú ý đặc biệt đến hệ thống dấu tiếng Việt:
      * Phân biệt chính xác tuyệt đối giữa dấu nặng (.) và dấu sắc ('), dấu hỏi (?) và dấu ngã (~), dấu mũ (â, ê, ô) và dấu móc (ơ, ư), chữ 'đ' và 'd'.

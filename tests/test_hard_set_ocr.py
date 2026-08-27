@@ -85,6 +85,29 @@ Ghi chú hợp đồng:
         self.assertNotIn("Lễ hội Đền Mẫu Thượng Ngàn, Lễ hội Đền Mẫu Thượng Ngàn", normalized)
         self.assertIn("Lễ hội Đền Mẫu Thượng Ngàn", normalized)
 
+    def test_remove_scanner_zoom_artifacts(self):
+        raw = """<!-- Page 1 -->
+
+Nội dung trang 1.
+
+<!-- Page 2 -->
+
+# 100%
+"""
+        normalized = normalize_structure(raw)
+        self.assertNotIn("100%", normalized)
+        self.assertIn("Nội dung trang 1.", normalized)
+
+    def test_orphan_think_and_pipes_normalization(self):
+        raw = """Số: 57/TTr - UBND | Ya Hội, ngày 28 tháng 6 năm 2016
+
+Nội dung văn bản.
+</think>
+"""
+        normalized = normalize_structure(raw)
+        self.assertNotIn("</think>", normalized)
+        self.assertIn("Số: 57/TTr - UBND\nYa Hội, ngày 28 tháng 6 năm 2016", normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

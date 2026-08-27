@@ -16,6 +16,8 @@ import tempfile
 import time
 import re
 import warnings
+import gc
+from io import BytesIO
 from pathlib import Path
 
 # Third-party PaddleX/Protobuf code still uses deprecated datetime APIs on
@@ -158,7 +160,12 @@ class OCRWorker:
                 output_path = output_markdown_path(self.output_dir, pdf_path)
 
                 # Render các trang PDF thành ảnh
-                with tempfile.TemporaryDirectory() as temp_dir:
+                try:
+                    temp_dir_ctx = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+                except TypeError:
+                    temp_dir_ctx = tempfile.TemporaryDirectory()
+
+                with temp_dir_ctx as temp_dir:
                     temp_dir_path = Path(temp_dir)
 
                     self.progress_queue.put(("log", "  - Đang render PDF thành hình ảnh (300 DPI)...\n"))
@@ -588,6 +595,7 @@ class OCRWorker:
                     ))
                     file_elapsed = time.perf_counter() - pdf_start_time
                     self.progress_queue.put(("log", f"  - Tổng thời gian OCR file: {format_elapsed(file_elapsed)}\n"))
+                    gc.collect()
 
             if self.stop_event.is_set():
                 batch_elapsed = time.perf_counter() - batch_start_time
@@ -972,19 +980,26 @@ class AppGUI:
         window.geometry("1050x780")
         canvas = tk.Canvas(window, background="#2b2b2b")
         canvas.pack(fill=tk.BOTH, expand=True)
-        with Image.open(self.latest_overlay_path) as source:
-            image = source.convert("RGB")
-            image.thumbnail((1000, 720))
-            photo = ImageTk.PhotoImage(image)
-        canvas.create_image(10, 10, anchor=tk.NW, image=photo)
-        canvas.create_text(10, image.height + 25, anchor=tk.W, fill="white",
-                           text="Xanh dương: vùng text | Cam: ranh giới cột | Đỏ: vùng bảng")
-        window._overlay_image = photo
+        try:
+            with open(self.latest_overlay_path, "rb") as f:
+                img_bytes = f.read()
+            with Image.open(BytesIO(img_bytes)) as source:
+                image = source.convert("RGB")
+                image.thumbnail((1000, 720))
+                photo = ImageTk.PhotoImage(image)
+            canvas.create_image(10, 10, anchor=tk.NW, image=photo)
+            canvas.create_text(10, image.height + 25, anchor=tk.W, fill="white",
+                               text="Xanh dương: vùng text | Cam: ranh giới cột | Đỏ: vùng bảng")
+            window._overlay_image = photo
+        except OSError as error:
+            messagebox.showerror("Lỗi", f"Không thể tải overlay:\n{error}")
 
     def update_inline_layout_overlay(self, overlay_path: Path):
         """Render the latest diagnostic image inside the main GUI."""
         try:
-            with Image.open(overlay_path) as source:
+            with open(overlay_path, "rb") as f:
+                img_bytes = f.read()
+            with Image.open(BytesIO(img_bytes)) as source:
                 image = source.convert("RGB")
                 max_width = max(self.layout_canvas.winfo_width() - 24, 300)
                 max_height = max(self.layout_canvas.winfo_height() - 14, 180)
@@ -1185,10 +1200,17 @@ class AppGUI:
             self.stats_active_var.set("Đang OCR: đang chuẩn bị...")
         self.root.after(100, self.poll_queue)
 
+def run_gui():
+    root = tk.Tk()
+    app = AppGUI(root)
+    root.mainloop()
+
+
 def main():
     root = tk.Tk()
     app = AppGUI(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

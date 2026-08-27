@@ -14,14 +14,15 @@ _BLOCK_START_RE = re.compile(
 )
 _PAGE_FOOTER_RE = re.compile(
     r"^\s*(?:"
-    r"(?:trang\s+)?\d+\s*/\s*\d+\s*(?:[-–—|]\s*mã\s+đề(?:\s+thi)?\s+\w+)?"
-    r"|\d+\s*\|\s*thông\s+tin\s+tuyển\s+sinh\s+huflit"
-    r"|thông\s+tin\s+tuyển\s+sinh\s+huflit(?:\s*\|\s*\d+|\s+\d+)?"
+    r"(?:trang|page)\s*\.?\s*\d{1,4}(?:\s*(?:/|trên|of|-)\s*\d{1,4})?\s*(?:[-–—|]\s*mã\s+đề(?:\s+thi)?\s+\w+)?"
+    r"|\d{1,4}\s*(?:/|trên|of)\s*\d{1,4}"
+    r"|\d{1,4}\s*\|\s*[^\n|]{3,60}"
+    r"|[^\n|]{3,60}\s*\|\s*\d{1,4}"
     r")\s*$",
     re.IGNORECASE,
 )
 _MAGAZINE_FOOTER_RE = re.compile(
-    r"^\s*[^\n]*#(?:ttdl|thongtindulich)[\w-]*[^\n]*$",
+    r"^\s*[^\n]*#[\wÀ-ỹĐđ-]{3,30}[^\n]*$",
     re.IGNORECASE,
 )
 _GENERIC_FOOTER_RE = re.compile(
@@ -29,7 +30,7 @@ _GENERIC_FOOTER_RE = re.compile(
     r"#\s*(?:[\wÀ-ỹĐđ-]*\d){6,}[\wÀ-ỹĐđ-]*"
     r"|(?:isbn|issn)\s*[:#]?\s*[\dXx-]{8,}"
     r"|(?:mã|số)\s+(?:xuất bản|đăng ký xuất bản|giấy phép)\s*[:#-]?\s*[\w./-]+"
-    r"|(?:trang|page)\s+\d{1,4}(?:\s*/\s*\d{1,4})?"
+    r"|(?:trang|page)\s*\.?\s*\d{1,4}(?:\s*(?:/|trên|of|-)\s*\d{1,4})?"
     r")\s*$",
     re.IGNORECASE,
 )
@@ -37,8 +38,18 @@ _STANDALONE_PAGE_NUMBER_RE = re.compile(
     r"^\s*(?:"
     r"[-–—~*•\s]+\d{1,4}[-–—~*•\s]+"
     r"|\[\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*\]"
+    r"|\(\s*[-–—]?\s*\d{1,4}\s*[-–—]?\s*\)"
     r"|(?:\*\*)?[-–—]?\s*\d{1,4}\s*[-–—]?(?:\*\*)?"
+    r"|\d{1,4}\s*\."
     r")\s*$"
+)
+_SCAN_ARTIFACT_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*)?(?:"
+    r"(?:zoom|scale|fit|tỷ\s*lệ|tỉ\s*lệ|khổ|size|auto)?\s*:?\s*\d{1,3}\s*%"
+    r"|(?:a4|a3|letter|legal)\s*(?:100%|\d{1,3}%)"
+    r"|100\s*%"
+    r")\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -291,7 +302,8 @@ def remove_standalone_page_artifacts(
             re.fullmatch(r"\s*(?:\*\*)?\d{1,3}(?:\*\*)?\s*", line)
             and _MAGAZINE_FOOTER_RE.fullmatch(next_nonblank)
         )
-        if is_footer or number_before_footer:
+        is_scan_artifact = bool(_SCAN_ARTIFACT_RE.fullmatch(line))
+        if is_footer or number_before_footer or is_scan_artifact:
             if stats is not None:
                 stats.page_artifacts_removed += 1
             continue
@@ -372,24 +384,113 @@ def collapse_repetition_loops(
     return "\n".join(output)
 
 
+def remove_repeated_running_headers_and_footers(
+    markdown: str, stats: MarkdownNormalizationStats | None = None
+) -> str:
+    """Identify and remove repeated running headers and footers across pages."""
+    parts = re.split(r"(<!--\s*Page\s+\d+\s*-->)", markdown, flags=re.IGNORECASE)
+    if len(parts) <= 3:
+        return markdown
+
+    page_tags: list[str] = []
+    page_bodies: list[str] = []
+    preamble = parts[0]
+    for i in range(1, len(parts), 2):
+        page_tags.append(parts[i])
+        page_bodies.append(parts[i + 1] if i + 1 < len(parts) else "")
+
+    if len(page_bodies) < 2:
+        return markdown
+
+    header_counts: dict[str, int] = {}
+    footer_counts: dict[str, int] = {}
+
+    def clean_text(line: str) -> str:
+        return re.sub(r"\s+", " ", line.strip().casefold())
+
+    for body in page_bodies:
+        lines = [l.strip() for l in body.splitlines() if l.strip()]
+        if not lines:
+            continue
+        for line in lines[:2]:
+            if not _BLOCK_START_RE.match(line) and len(line) >= 4 and not line.startswith(("<table", "|", "#")):
+                key = clean_text(line)
+                header_counts[key] = header_counts.get(key, 0) + 1
+        for line in lines[-2:]:
+            if not _BLOCK_START_RE.match(line) and len(line) >= 4 and not line.startswith(("<table", "|", "#")):
+                key = clean_text(line)
+                footer_counts[key] = footer_counts.get(key, 0) + 1
+
+    repeated_headers = {k for k, v in header_counts.items() if v >= 2 and v >= len(page_bodies) * 0.35}
+    repeated_footers = {k for k, v in footer_counts.items() if v >= 2 and v >= len(page_bodies) * 0.35}
+
+    cleaned_bodies: list[str] = []
+    for page_idx, body in enumerate(page_bodies):
+        lines = body.splitlines()
+        non_empty_indices = [idx for idx, l in enumerate(lines) if l.strip()]
+        lines_to_remove: set[int] = set()
+
+        # Running headers are removed from page 2 onwards (or if identical across all)
+        for idx in non_empty_indices[:2]:
+            stripped = clean_text(lines[idx])
+            if stripped in repeated_headers:
+                lines_to_remove.add(idx)
+                if stats is not None:
+                    stats.page_artifacts_removed += 1
+
+        for idx in non_empty_indices[-2:]:
+            stripped = clean_text(lines[idx])
+            if stripped in repeated_footers:
+                lines_to_remove.add(idx)
+                if stats is not None:
+                    stats.page_artifacts_removed += 1
+
+        kept_lines = [l for idx, l in enumerate(lines) if idx not in lines_to_remove]
+        cleaned_bodies.append("\n".join(kept_lines).strip())
+
+    result: list[str] = []
+    if preamble.strip():
+        result.append(preamble.strip())
+    for tag, body in zip(page_tags, cleaned_bodies):
+        tag_str = tag.strip()
+        if body:
+            entry = f"{tag_str}\n\n{body}"
+        else:
+            entry = tag_str
+        result.append(entry)
+    return "\n\n".join(result)
+
+
+
 def stitch_cross_page_paragraphs(
     markdown: str, stats: MarkdownNormalizationStats | None = None
 ) -> str:
     """Reconnect a sentence/paragraph continuation broken across page boundaries."""
     pattern = re.compile(
-        r"([^\n.!?:\;#\->`|*$\s][^\n.!?:\;#`|*$]*?)\n{1,3}\s*(<!--\s*Page\s+\d+\s*-->)\n{1,3}\s*([a-zà-ỹđ\d][^\n]*)",
-        re.IGNORECASE | re.UNICODE,
+        r"([^\n.!?:\;#\->`|*$\s][^\n.!?:\;#`|*$]*?)\n{1,3}\s*(<!--\s*Page\s+\d+\s*-->)\n{1,3}\s*([^\n]+)",
+        re.UNICODE,
     )
 
     def repl(m: re.Match[str]) -> str:
         before = m.group(1).rstrip()
         page_tag = m.group(2).strip()
         after = m.group(3).lstrip()
-        if after[:1].islower():
+
+        if _BLOCK_START_RE.match(after):
+            return m.group(0)
+
+        is_continuation = (
+            after[:1].islower()
+            or before.endswith("-")
+            or before.endswith(",")
+            or bool(re.match(r"^(?:và|hoặc|trong|của|được|với|tại|theo|do|bởi|như|là|mà|để|năm\s+\d+|\d+)\b", after, re.IGNORECASE))
+        )
+
+        if is_continuation:
             if stats is not None:
                 stats.paragraph_lines_joined += 1
             if before.endswith("-"):
-                return f"{before[:-1]} {page_tag} {after}"
+                return f"{before[:-1].rstrip()} {page_tag} {after}"
             return f"{before} {page_tag} {after}"
         return m.group(0)
 
@@ -408,10 +509,13 @@ def strip_assistant_conversational_artifacts(markdown: str) -> str:
         if is_blank_ocr_response(block):
             cleaned_blocks.append("")
             continue
+        # Strip thinking blocks and orphan think tags
+        cleaned = re.sub(r"<think\b[^>]*>.*?</think>", "", block, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"</?think\b[^>]*>", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(
             r"\A\s*(?:(?:Here (?:is|are)|Below is|Dưới đây là|Certainly|Sure|Based on (?:your|the) requirements)[^\n]*?(?:OCR|transcription|extracted|requested|chuyển đổi|văn bản)?[^\n]*?:\s*\n+)+",
             "",
-            block,
+            cleaned,
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(
@@ -523,13 +627,52 @@ def collapse_inline_repetitions(markdown: str) -> str:
     return "\n".join(output)
 
 
+def normalize_orphan_pipes(markdown: str) -> str:
+    """Normalize non-table orphan pipes in document headers and signature blocks."""
+    lines = markdown.splitlines()
+    output: list[str] = []
+    fenced = display_math = False
+    html_table_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            fenced = not fenced
+        if not fenced and stripped == "$$":
+            display_math = not display_math
+        html_table_depth += len(re.findall(r"<table\b", stripped, re.IGNORECASE))
+        protected = fenced or display_math or html_table_depth > 0
+        html_table_depth = max(
+            0, html_table_depth - len(re.findall(r"</table>", stripped, re.IGNORECASE))
+        )
+        if protected or "|" not in line:
+            output.append(line)
+            continue
+
+        # 1. Document metadata / header lines: "Số: 57/TTr - UBND | Ya Hội, ngày 28 tháng 6 năm 2016"
+        if re.match(r"^\s*(?:Số\s*:\s*|Căn\s+cứ\s+|Kính\s+gửi\s*:)[^|\n]+\|\s*.+$", stripped, re.IGNORECASE):
+            parts = [p.strip() for p in stripped.split("|") if p.strip()]
+            output.extend(parts)
+            continue
+
+        # 2. Broken single-pipe lines at start: "| CHỦ TỊCH | Chủ trì" -> "CHỦ TỊCH | Chủ trì"
+        if stripped.startswith("|") and not stripped.endswith("|") and "---" not in stripped:
+            cleaned_line = re.sub(r"^\s*\|\s*", "", stripped)
+            output.append(cleaned_line)
+            continue
+
+        output.append(line)
+    return "\n".join(output)
+
+
 def normalize_structure(
     markdown: str, stats: MarkdownNormalizationStats | None = None
 ) -> str:
     """Apply safe structural repairs before table/math-specific finalization."""
     markdown = strip_assistant_conversational_artifacts(markdown)
+    markdown = remove_repeated_running_headers_and_footers(markdown, stats)
     markdown = collapse_repetition_loops(markdown, stats)
     markdown = collapse_inline_repetitions(markdown)
+    markdown = normalize_orphan_pipes(markdown)
     markdown = normalize_headings(markdown, stats)
     markdown = normalize_paragraphs_and_lists(markdown, stats)
     markdown = normalize_checkboxes(markdown)
