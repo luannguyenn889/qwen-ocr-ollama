@@ -108,6 +108,19 @@ Nội dung văn bản.
         self.assertNotIn("</think>", normalized)
         self.assertIn("Số: 57/TTr - UBND\nYa Hội, ngày 28 tháng 6 năm 2016", normalized)
 
+    def test_remove_empty_pipe_rows(self):
+        raw = """
+Đơn vị
+| | | | | | | | | | | | | | | | | | | | | | | | | | | | | | |
+
+Dự toán năm 2025 (Đơn vị tính: đồng)
+| | | | | | | | | | | | | | | | | | | | | | | | | | | | | | |
+"""
+        normalized = normalize_structure(raw)
+        self.assertNotIn("| | |", normalized)
+        self.assertIn("Đơn vị", normalized)
+        self.assertIn("Dự toán năm 2025", normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

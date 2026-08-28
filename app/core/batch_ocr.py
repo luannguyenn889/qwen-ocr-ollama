@@ -68,9 +68,8 @@ ENABLE_LAYOUT_DETECTION = True
 TEXT_ONLY_OUTPUT = False
 
 # The classifier is explicitly instructed to return ``logo`` or ``uncertain``
-# when a circular logo cannot be distinguished safely from an ink stamp.  A
-# genuine ``stamp``/``signature`` result is therefore actionable from 0.90;
-# requiring 0.98 caused verified stamps in faint scans to be emitted as images.
+# when a circular logo cannot be distinguished safely from an ink stamp. A
+# genuine ``stamp``/``signature`` result is therefore actionable from 0.90.
 SIGNATURE_STAMP_CONFIDENCE = 0.90
 
 # DPI độ phân giải cao hơn dành riêng cho các trang có bảng biểu được nhận diện (Super-Resolution)
@@ -1034,11 +1033,12 @@ def classify_graphic_crop(client, model: str, crop_path: Path, *, before_request
 Chọn đúng một category: content_image, logo, signature, stamp, text_fragment, table, decoration, page_canvas, uncertain.
 content_image chỉ gồm ảnh chụp thật, tranh vẽ, biểu đồ thống kê (chart) hoặc sơ đồ khối minh họa độc lập.
 table gồm bảng biểu, bảng tính, lưới ô kẻ chứa dữ liệu hoặc biểu mẫu số liệu (KHÔNG phải content_image).
-logo gồm biểu trưng cơ quan/thương hiệu, huy hiệu, logo tròn hoặc logo có chữ được thiết kế sạch.
-stamp chỉ là dấu mực thực sự đóng lên tài liệu, thường có nét mực không đều, chồng lên chữ/nền giấy.
+logo gồm biểu trưng cơ quan/thương hiệu, huy hiệu hoặc logo có chữ được thiết kế đồ họa sạch (KHÔNG phải con dấu mực).
+stamp là con dấu mực thực sự đóng lên tài liệu, dấu tròn cơ quan, dấu giáp lai, dấu treo, dấu mờ, hoặc vết mực con dấu in hằn mờ qua mặt giấy.
+signature là chữ ký tay của người ký tên.
 text_fragment là bảng biểu, mảnh chữ, đường kẻ hoặc một phần textbox bị cắt rời, không phải hình minh họa độc lập.
 page_canvas là ảnh nền hoặc ảnh gần như chứa toàn bộ trang, làm lặp nội dung OCR của trang.
-Không được chọn content_image nếu ảnh chứa bảng số liệu, danh sách dòng kẻ, văn bản hoặc biểu mẫu tài liệu.
+Không được chọn content_image nếu ảnh chứa con dấu mực, chữ ký, bảng số liệu, danh sách dòng kẻ, văn bản hoặc biểu mẫu tài liệu.
 Chỉ trả JSON: {"category":"...","confidence":0.0}"""
     temporary_images: list[Path] = []
 
@@ -2741,7 +2741,7 @@ def ocr_qwen_images(
         if before_request is not None:
             before_request()
         instruction = ("\n\n" + TABLE_SAFE_INSTRUCTION if has_table else "") + extra_instruction
-        log_func(f"Qwen vision OCR ({image_number}/{len(images)}).")
+        log_func(f"Nhận diện Qwen Vision ({image_number}/{len(images)}).")
         chunks = generate_with_retry(
             client,
             dict(
@@ -2792,8 +2792,8 @@ def ocr_coordinate_blocks(
         return None
     image_count = sum(block.kind == "image" for block in blocks)
     log_func(
-        f"Fast layout: {len(blocks)} blocks, {image_count} image blocks; "
-        "OCR full page in one request."
+        f"Layout nhanh: {len(blocks)} khối, {image_count} khối ảnh; "
+        "OCR toàn trang trong một lượt."
     )
     placement_instruction = """
 
@@ -2851,16 +2851,36 @@ def output_markdown_path(output_dir: Path, pdf_path: Path) -> Path:
 
 
 # Hàm chính xử lý OCR cho một tệp PDF đơn lẻ
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds for compact, readable logs."""
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} giờ {minutes} phút {secs} giây"
+    if minutes:
+        return f"{minutes} phút {secs} giây"
+    return f"{secs} giây"
+
+
+# Hàm chính xử lý OCR cho một tệp PDF đơn lẻ
 def process_single_pdf(
     pdf_path: Path, output_dir: Path, client: Client, model_name: str,
     workers: int = 1, render_dpi: int = 300, skip_blank_pages: bool = True,
     blank_detection_sensitivity: str = "safe",
-):
+    stop_event: threading.Event | None = None,
+    resume_event: threading.Event | None = None,
+    progress_callback = None,
+    log_func = None,
+    spell_correct: bool = False,
+    layout_overlay_sink = None,
+) -> Path:
     """
     Tiến hành lập trình tự render và nhận diện OCR toàn bộ tệp PDF:
     - Khởi tạo thư mục và quét số trang.
     - Chạy phân tích bố cục PaddleOCR để phát hiện bảng/cột.
     - Xử lý nhận diện và ghép nối nội dung.
+    - Hỗ trợ callbacks cập nhật giao diện và cơ chế hủy/tạm dừng.
     """
     if workers < 1:
         raise ValueError("workers must be at least 1")
@@ -2873,13 +2893,42 @@ def process_single_pdf(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_markdown_path(output_dir, pdf_path)
     temp_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    print(f"\nProcessing: {pdf_path.name} -> {output_path.name}")
+
+    def _emit_log(message: str):
+        msg_clean = message.rstrip("\n")
+        msg_with_nl = msg_clean + "\n"
+        if progress_callback is not None:
+            progress_callback("log", msg_with_nl)
+        if log_func is not None:
+            log_func(msg_clean)
+        elif progress_callback is None:
+            print(msg_clean)
+
+    def _emit_event(event_name: str, payload = None):
+        if progress_callback is not None:
+            progress_callback(event_name, payload)
+
+    def _before_qwen_request():
+        if resume_event is not None:
+            resume_event.wait()
+        if stop_event is not None and stop_event.is_set():
+            raise PipelineCancelled()
+
+    _emit_log(f"\n[File] Đang xử lý: {pdf_path.name}\n")
+    _emit_event("stage_status", "OCR")
     document_started_at = perf_counter()
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    try:
+        temp_dir_ctx = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    except TypeError:
+        temp_dir_ctx = tempfile.TemporaryDirectory()
+
+    with temp_dir_ctx as temp_dir:
         temp_dir_path = Path(temp_dir)
         total_pages = pdf_page_count(pdf_path)
-        print(f"Pipelining render and OCR for {total_pages} pages (workers={workers})...")
+        _emit_log(f"  - Đang render PDF thành hình ảnh (300 DPI) cho {total_pages} trang (luồng={workers})...")
+        _emit_event("page_progress", (0, total_pages))
+
         structural_blank_pages = (
             structural_blank_page_numbers(pdf_path) if skip_blank_pages else set()
         )
@@ -2887,15 +2936,17 @@ def process_single_pdf(
         uncertain_page_numbers: set[int] = set()
         signature_only_page_numbers: set[int] = set()
         page_stats_lock = threading.Lock()
+        pages_processed = [0]
+
         for page_num in sorted(structural_blank_pages):
-            print(f"    -> Bỏ qua trang {page_num} (trang trắng; cấu trúc PDF rỗng)")
+            _emit_log(f"    -> Bỏ qua trang {page_num} (trang trắng; cấu trúc PDF rỗng)")
         if skip_blank_pages:
-            print(f"Blank-page sensitivity: {blank_detection_sensitivity}.")
+            _emit_log(f"  - Độ nhạy phát hiện trang trắng: {blank_detection_sensitivity}.")
         from app.core.formula_ocr import formula_ocr_status
         _, formula_status = formula_ocr_status()
-        print(f"Formula OCR status: {formula_status}.")
+        _emit_log(f"  - Trạng thái Formula OCR: {formula_status}.")
 
-        from concurrent.futures import ThreadPoolExecutor
+        import concurrent.futures
 
         render_timings: dict[Path, float] = {}
         layout_lock = threading.Lock()
@@ -2906,39 +2957,42 @@ def process_single_pdf(
             try:
                 from app.core.layout_detector import create_layout_detector
                 layout_detector, layout_status = create_layout_detector()
-                print(f"Layout status: {layout_status}.")
+                _emit_log(f"  - Trạng thái layout: {layout_status}.")
             except Exception as layout_error:
-                print(f"Layout status: disabled; using full pages ({layout_error}).")
+                _emit_log(f"  - Trạng thái layout: disabled; dùng nguyên trang ({layout_error}).")
 
         # Hàm worker chạy nhận diện OCR cho từng trang song song
         def process_page_worker(idx_img):
+            if stop_event is not None and stop_event.is_set():
+                raise PipelineCancelled()
             idx, img_path = idx_img
             page_num = idx + 1
             qwen_model = hybrid_model if is_hybrid else resolve_qwen_model(model_name)
             page_block_spans = []
             mapped_markdown = None
 
-            print(f"OCR'ing page {page_num}/{total_pages}: {img_path.name}...")
+            _emit_log(f"  - Đang OCR Trang {page_num}/{total_pages}...")
             started_at = perf_counter()
+            _emit_event("page_timer_start", (page_num, started_at))
+            _emit_event("page_sub_progress", (page_num, 0.15, "Tiền xử lý ảnh"))
 
-            # Chuẩn hóa hướng trang trước mọi phép phân tích để Paddle Layout,
-            # Qwen Vision, formula OCR và bước review dùng cùng một hệ tọa độ.
+            # Chuẩn hóa hướng trang trước mọi phép phân tích
             page_rotation = 0
             try:
                 page_rotation = orient_page_file(img_path)
                 if page_rotation:
-                    print(f"    -> Auto-rotated page {page_num} by {page_rotation} degrees.")
+                    _emit_log(f"    -> Tự động xoay trang {page_num} {page_rotation} độ.")
             except Exception as orientation_error:
-                print(
-                    f"    [Warning] Auto-rotate failed on page {page_num}; "
-                    f"using rendered orientation: {orientation_error}"
+                _emit_log(
+                    f"    [Cảnh báo] Tự động xoay thất bại ở trang {page_num}; "
+                    f"dùng hướng gốc: {orientation_error}"
                 )
 
             # Tiền xử lý nâng cao tương phản và khử nền ố vàng/nhiễu cho tài liệu scan
             try:
                 from app.core.image_preprocessor import enhance_scanned_document
                 enhance_scanned_document(img_path, output_path=img_path)
-            except Exception as enhance_err:
+            except Exception:
                 pass
 
             page_md = ""
@@ -2958,19 +3012,35 @@ def process_single_pdf(
             # Phân tích bố cục bằng PaddleOCR nếu bộ phát hiện được nạp thành công
             if layout_detector is not None:
                 try:
+                    _emit_event("page_sub_progress", (page_num, 0.30, "Phân tích bố cục"))
                     paddle_started_at = perf_counter()
                     with layout_lock:
                         page_analysis = layout_detector.analyse_page(img_path)
                     segments = page_analysis.segments
                     has_table = bool(page_analysis.tables)
                     ordered_blocks = page_analysis.blocks
+                    text_regions = [bbox for kind, bbox in page_analysis.blocks if kind in {"text", "heading", "formula"}]
+                    table_regions = page_analysis.tables
                     paddle_seconds = perf_counter() - paddle_started_at
+
+                    try:
+                        from app.core.layout_detector import save_layout_overlay
+                        overlay_path = save_layout_overlay(
+                            img_path,
+                            temp_dir_path / "layout_debug" / f"{normalized_document_stem(pdf_path)}_page_{page_num}_layout.png",
+                            text_regions, segments, table_regions,
+                        )
+                        if layout_overlay_sink is not None:
+                            layout_overlay_sink(overlay_path)
+                        _emit_event("layout_overlay", overlay_path)
+                    except Exception:
+                        pass
+
                     if segments and len(segments) >= 2:
                         from app.core.layout_detector import crop_segments
                         qwen_images = crop_segments(img_path, segments, temp_dir_path / "segments")
-                        print(f"    -> Layout detected {len(qwen_images)} segments on page {page_num}.")
+                        _emit_log(f"    -> Layout phát hiện {len(qwen_images)} phân đoạn ở trang {page_num}.")
                     if has_table:
-                        # Cắt nhỏ bảng sẽ làm hỏng ngữ cảnh hàng/cột, dùng ảnh gốc độ phân giải cao
                         table_page = render_table_page(
                             pdf_path, idx, temp_dir_path / "table_pages"
                         )
@@ -2982,9 +3052,9 @@ def process_single_pdf(
                             oriented_table.save(table_page, format="PNG")
                             oriented_table.close()
                         qwen_images = [table_page]
-                        print(f"    -> Layout detected table on page {page_num}; re-rendered at {TABLE_RENDER_DPI} DPI.")
+                        _emit_log(f"    -> Phát hiện bảng, render lại {TABLE_RENDER_DPI} DPI trước khi gửi Qwen.")
                 except Exception as layout_error:
-                    print(f"    [Warning] Layout detection failed on page {page_num}; using full page: {layout_error}")
+                    _emit_log(f"    [Cảnh báo] Layout lỗi, dùng nguyên trang: {layout_error}")
                     qwen_images, has_table = [img_path], False
                     segments = None
                     ordered_blocks = []
@@ -3007,14 +3077,15 @@ def process_single_pdf(
                     table_regions=page_analysis.tables if page_analysis else [],
                     graphic_classifier=lambda crop: classify_graphic_crop(
                         client, qwen_model, crop,
-                        log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
+                        log_func=lambda message: _emit_log(f"    -> [Trang {page_num}] {message}"),
+                        before_request=_before_qwen_request,
                     ),
                     discarded_graphics_sink=discarded_graphics,
                 )
             except StopIteration:
                 pass
             except Exception as img_err:
-                print(f"    -> [Warning] Failed to extract images: {img_err}")
+                _emit_log(f"    -> [Chú ý] Không thể trích xuất ảnh: {img_err}")
 
             removable_regions = [
                 bbox for category, confidence, bbox in discarded_graphics
@@ -3024,10 +3095,13 @@ def process_single_pdf(
                 img_path, removable_regions, blank_detection_sensitivity,
             ):
                 cleanup_unreferenced_assets("", extracted_img_paths, output_dir)
-                print(f"    -> Bỏ qua trang {page_num} (chỉ chứa chữ ký/con dấu)")
+                _emit_log(f"    -> Bỏ qua trang {page_num} (chỉ chứa chữ ký/con dấu)")
                 with page_stats_lock:
                     signature_only_page_numbers.add(page_num)
                     uncertain_page_numbers.discard(page_num)
+                    pages_processed[0] += 1
+                    _emit_event("page_sub_progress", (page_num, 1.0, "Hoàn tất trang"))
+                    _emit_event("page_progress", (pages_processed[0], total_pages))
                 return page_num, "", None
 
             if page_analysis is not None:
@@ -3079,15 +3153,16 @@ def process_single_pdf(
                                         formulas_latex.append(f"\n$$\n{latex_str}\n$$\n")
                                     else:
                                         formulas_latex.append(f"${latex_str}$")
-                        print(f"    -> Extracted {len(formulas_latex)} formulas via LaTeX-OCR on page {page_num}.")
+                        _emit_log(f"    -> Đã trích xuất {len(formulas_latex)} công thức qua LaTeX-OCR ở trang {page_num}.")
                 except Exception as formula_err:
-                    print(f"    -> [Warning] Failed to extract formulas: {formula_err}")
+                    _emit_log(f"    -> [Cảnh báo] Trích xuất công thức thất bại: {formula_err}")
                 finally:
                     formula_seconds = perf_counter() - formula_started_at
 
             # 2. Thực hiện OCR và làm sạch kết quả bằng Qwen
             qwen_model = hybrid_model if is_hybrid else resolve_qwen_model(model_name)
             try:
+                _emit_event("page_sub_progress", (page_num, 0.50, "Qwen Vision OCR"))
                 qwen_started_at = perf_counter()
                 assets_applied = False
                 formula_instruction = (
@@ -3099,21 +3174,25 @@ def process_single_pdf(
                     client, qwen_model, img_path, ordered_blocks, extracted_img_paths,
                     temp_dir_path / "layout_blocks" / f"page_{page_num}",
                     page_number=page_num,
-                    log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
+                    log_func=lambda message: _emit_log(f"    -> [Trang {page_num}] {message}"),
                     mapping_sink=page_block_spans,
+                    before_request=_before_qwen_request,
                 )
                 if page_md is not None:
                     mapped_markdown = page_md
                     assets_applied = True
-                    print(f"    -> OCRed page {page_num} once and placed images in reading order.")
+                    _emit_log(f"    -> Đã OCR toàn trang một lần và đặt ảnh theo reading order.")
                 else:
                     page_md = ocr_qwen_images(
                         client, qwen_model, qwen_images, has_table=has_table,
                         extra_instruction=formula_instruction,
-                        log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
+                        log_func=lambda message: _emit_log(f"    -> [Trang {page_num}] {message}"),
+                        before_request=_before_qwen_request,
                     )
                 qwen_seconds = perf_counter() - qwen_started_at
                 qwen_first_seconds = qwen_seconds
+            except PipelineCancelled:
+                raise
             except Exception as ollama_err:
                 qwen_seconds = perf_counter() - qwen_started_at
                 error = f"Qwen OCR failed: {ollama_err}"
@@ -3123,12 +3202,15 @@ def process_single_pdf(
                 with page_stats_lock:
                     blank_page_numbers.add(page_num)
                     uncertain_page_numbers.discard(page_num)
-                print(f"    -> Bỏ qua trang {page_num} (Qwen xác nhận không có nội dung)")
+                    pages_processed[0] += 1
+                    _emit_event("page_sub_progress", (page_num, 1.0, "Hoàn tất trang"))
+                    _emit_event("page_progress", (pages_processed[0], total_pages))
+                _emit_log(f"    -> Bỏ qua trang {page_num} (Qwen xác nhận không có nội dung)")
                 return page_num, "", None
 
             # 2.5. Thay thế placeholder công thức và hình ảnh theo thứ tự đọc
             if extracted_img_paths:
-                print(f"    -> Extracted {len(extracted_img_paths)} images from PDF page {page_num}.")
+                _emit_log(f"    -> Đã trích xuất {len(extracted_img_paths)} hình ảnh từ PDF trang {page_num}.")
             if page_md:
                 page_md = apply_page_assets(
                     page_md, page_num,
@@ -3138,76 +3220,98 @@ def process_single_pdf(
 
             # 3. Quality gate: retry only this page once when under quality threshold.
             if not error:
+                _emit_event("page_sub_progress", (page_num, 0.85, "Kiểm tra chất lượng"))
                 from app.core.quality_gate import choose_best_page, evaluate_page
                 report = evaluate_page(page_md, output_dir, check_tables=has_table)
-                errors_str = f"Errors: {', '.join(report.errors)}" if report.errors else "No errors"
-                warnings_str = f", Warnings: {', '.join(report.warnings)}" if report.warnings else ""
-                print(f"    -> [Quality Gate Page {page_num}] Score: {report.score}/100.0 ({errors_str}{warnings_str})")
+                errors_str = f"Lỗi: {', '.join(report.errors)}" if report.errors else "Không có lỗi"
+                warnings_str = f", Cảnh báo: {', '.join(report.warnings)}" if report.warnings else ""
+                _emit_log(f"    -> [Quality Gate Trang {page_num}] Điểm chất lượng: {report.score}/100.0 ({errors_str}{warnings_str})")
                 if report.warnings:
-                    print(f"    -> [Warning] Page {page_num}: {', '.join(report.warnings)}")
+                    _emit_log(f"    -> [Cảnh báo] Trang {page_num}: {', '.join(report.warnings)}")
                 if report.should_retry:
+                    _emit_event("stage_status", f"Quality retry – trang {page_num}")
                     initial_md, initial_report = page_md, report
-                    print(f"    -> Quality retry page {page_num} (Score: {report.score}/100 < threshold or fatal): {', '.join(report.errors)}")
+                    _emit_log(f"    -> Quality retry trang {page_num} (Điểm: {report.score}/100 < ngưỡng hoặc có lỗi nghiêm trọng): {', '.join(report.errors)}")
                     retry_started_at = perf_counter()
                     try:
                         retry_md = ocr_qwen_images(
                             client, qwen_model, [img_path], has_table=has_table,
                             extra_instruction="\n\n" + quality_retry_instruction(initial_md, ", ".join(report.errors)),
-                            log_func=lambda message: print(f"    -> [Page {page_num}] {message}"),
+                            log_func=lambda message: _emit_log(f"    -> [Trang {page_num}] {message}"),
+                            before_request=_before_qwen_request,
                         )
                         retry_md = apply_page_assets(retry_md, page_num, extracted_img_paths, formulas_latex)
                         second_report = evaluate_page(retry_md, output_dir, check_tables=has_table)
-                        second_errors_str = f"Errors: {', '.join(second_report.errors)}" if second_report.errors else "No errors"
-                        second_warnings_str = f", Warnings: {', '.join(second_report.warnings)}" if second_report.warnings else ""
-                        print(f"    -> [Quality Gate Retry Page {page_num}] Score: {second_report.score}/100.0 ({second_errors_str}{second_warnings_str})")
+                        second_errors_str = f"Lỗi: {', '.join(second_report.errors)}" if second_report.errors else "Không có lỗi"
+                        second_warnings_str = f", Cảnh báo: {', '.join(second_report.warnings)}" if second_report.warnings else ""
+                        _emit_log(f"    -> [Quality Gate Retry Trang {page_num}] Điểm sau retry: {second_report.score}/100.0 ({second_errors_str}{second_warnings_str})")
                         if second_report.warnings:
-                            print(f"    -> [Warning] Retry page {page_num}: {', '.join(second_report.warnings)}")
+                            _emit_log(f"    -> [Cảnh báo] Retry trang {page_num}: {', '.join(second_report.warnings)}")
                         page_md, report = choose_best_page(
                             initial_md, initial_report, retry_md, second_report
                         )
                         if page_md == retry_md:
                             page_block_spans = []
 
+                    except PipelineCancelled:
+                        raise
                     except Exception as retry_error:
                         page_md, report = initial_md, initial_report
-                        print(f"    -> [Warning] Quality retry failed on page {page_num}; keeping original result: {retry_error}")
+                        _emit_log(f"    -> [Cảnh báo] Retry trang {page_num} bị lỗi; giữ kết quả ban đầu: {retry_error}")
                     finally:
                         retry_seconds = perf_counter() - retry_started_at
+                        _emit_event("stage_status", "OCR")
                     if not report.passed:
-                        print(
-                            f"    -> [Warning] Page {page_num} still failed quality gate "
-                            f"({', '.join(report.errors)}); using best result and continuing."
+                        _emit_log(
+                            f"    -> [Cảnh báo] Trang {page_num} (Điểm: {report.score}/100) "
+                            f"({', '.join(report.errors)}); dùng kết quả tốt nhất và tiếp tục."
                         )
 
             page_md, extracted_img_paths, duplicate_assets = deduplicate_exact_assets(
                 page_md, extracted_img_paths, output_dir,
             )
             if duplicate_assets:
-                print(f"    -> Collapsed {duplicate_assets} byte-identical image(s) on page {page_num}.")
+                _emit_log(f"    -> Đã gộp {duplicate_assets} ảnh trùng hoàn toàn ở trang {page_num}.")
             removed_assets = cleanup_unreferenced_assets(page_md, extracted_img_paths, output_dir)
             if removed_assets:
-                print(f"    -> Removed {removed_assets} unreferenced extracted image(s) from page {page_num}.")
+                _emit_log(f"    -> Đã xóa {removed_assets} ảnh trích xuất không được tham chiếu ở trang {page_num}.")
 
             qwen_seconds = perf_counter() - qwen_started_at if 'qwen_started_at' in locals() else qwen_seconds
             elapsed = perf_counter() - started_at
-            print(
+            _emit_log(
                 f"    Benchmark: Render {render_seconds:.1f}s | Layout {paddle_seconds:.1f}s | "
-                f"Qwen first {qwen_first_seconds:.1f}s | Retry {retry_seconds:.1f}s | "
+                f"Qwen lần đầu {qwen_first_seconds:.1f}s | Retry {retry_seconds:.1f}s | "
                 f"Formula OCR {formula_seconds:.1f}s"
             )
-            print(f"Page {page_num} done in {elapsed:.1f}s.")
-            review_regions[page_num] = [bbox for kind, bbox in ordered_blocks if kind != "image"]
-            review_graphics[page_num] = [bbox for kind, bbox in ordered_blocks if kind == "image"]
-            if not error:
-                review_quality_scores[page_num] = report.score
-            if page_block_spans and mapped_markdown is not None and page_md != mapped_markdown:
-                from app.core.block_assembler import rebase_block_spans
-                page_block_spans = rebase_block_spans(mapped_markdown, page_md, page_block_spans)
-            review_block_spans[page_num] = page_block_spans
+            _emit_log(f"    -> Hoàn thành Trang {page_num} ({elapsed:.1f} giây)")
+
+            with page_stats_lock:
+                pages_processed[0] += 1
+                pages_done = pages_processed[0]
+                _emit_event("page_sub_progress", (page_num, 1.0, "Hoàn tất trang"))
+                if pages_done % 5 == 0:
+                    gc.collect()
+                    _emit_log(f"    -> [Memory] Đã dọn rác RAM sau {pages_done} trang.")
+                elapsed_total = perf_counter() - document_started_at
+                avg_time = elapsed_total / pages_done if pages_done else 0.0
+                remaining_pages = max(0, total_pages - pages_done)
+                eta_seconds = avg_time * remaining_pages
+                _emit_event("stats_update", (avg_time, eta_seconds))
+                _emit_event("page_progress", (pages_done, total_pages))
+
+                review_regions[page_num] = [bbox for kind, bbox in ordered_blocks if kind != "image"]
+                review_graphics[page_num] = [bbox for kind, bbox in ordered_blocks if kind == "image"]
+                if not error:
+                    review_quality_scores[page_num] = report.score
+                if page_block_spans and mapped_markdown is not None and page_md != mapped_markdown:
+                    from app.core.block_assembler import rebase_block_spans
+                    page_block_spans = rebase_block_spans(mapped_markdown, page_md, page_block_spans)
+                review_block_spans[page_num] = page_block_spans
+
             return page_num, page_md, error
 
         # Gửi tác vụ OCR ngay khi từng trang được render xong
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = []
             results = [(page_num, "", None) for page_num in sorted(structural_blank_pages)]
             page_image_paths: dict[int, Path] = {}
@@ -3215,10 +3319,17 @@ def process_single_pdf(
             review_graphics: dict[int, list[BoundingBox]] = {}
             review_quality_scores: dict[int, float] = {}
             review_block_spans: dict[int, list] = {}
+
+            if structural_blank_pages:
+                pages_processed[0] += len(structural_blank_pages)
+                _emit_event("page_progress", (pages_processed[0], total_pages))
+
             for index, image_path in enumerate(iter_render_pdf_to_images(
                 pdf_path, temp_dir_path, dpi=render_dpi, render_timings=render_timings,
                 skip_page_numbers=structural_blank_pages,
             )):
+                if stop_event is not None and stop_event.is_set():
+                    raise PipelineCancelled()
                 match = re.search(r"page_(\d+)", image_path.stem)
                 page_num = int(match.group(1)) if match else index + 1
                 index = page_num - 1
@@ -3227,13 +3338,15 @@ def process_single_pdf(
                     image_path, blank_detection_sensitivity,
                 )
                 if skip_blank_pages and state == "blank":
-                    print(f"    -> Bỏ qua trang {page_num} (trang trắng)")
+                    _emit_log(f"    -> Bỏ qua trang {page_num} (trang trắng)")
                     results.append((page_num, "", None))
                     blank_page_numbers.add(page_num)
+                    pages_processed[0] += 1
+                    _emit_event("page_progress", (pages_processed[0], total_pages))
                     continue
                 if skip_blank_pages and state == "uncertain":
                     uncertain_page_numbers.add(page_num)
-                    print(
+                    _emit_log(
                         f"    -> Trang {page_num} không chắc chắn có trắng hay không; giữ để OCR "
                         f"(light={float(metrics.get('light_ratio', 0.0)):.2%}, "
                         f"background={float(metrics.get('background_level', 0.0)):.1f}, "
@@ -3243,33 +3356,54 @@ def process_single_pdf(
                         f"rules={int(metrics.get('horizontal_rules', 0))}/"
                         f"{int(metrics.get('vertical_rules', 0))})"
                     )
-                futures.append(executor.submit(process_page_worker, (index, image_path)))
-            results.extend(future.result() for future in futures)
+                future = executor.submit(process_page_worker, (index, image_path))
+                future.add_done_callback(
+                    lambda _future, p_num=page_num: _emit_event("page_timer_end", p_num)
+                )
+                futures.append(future)
+
+            for future in concurrent.futures.as_completed(futures):
+                if stop_event is not None and stop_event.is_set():
+                    for f in futures:
+                        f.cancel()
+                    raise PipelineCancelled()
+                res = future.result()
+                if res is not None:
+                    results.append(res)
 
         # Sắp xếp lại theo đúng thứ tự số trang ban đầu
         results.sort(key=lambda x: x[0])
+        _emit_event("stage_status", "Hậu kiểm ảnh")
+        _emit_event("stage_progress", 94)
+
         from app.core.image_grounded_review import review_suspicious_lines
         reviewed_results = []
         for page_num, page_md, error in results:
+            if stop_event is not None and stop_event.is_set():
+                raise PipelineCancelled()
             if page_md and not error:
                 try:
                     page_md = review_suspicious_lines(
                         client, resolve_qwen_model(model_name), page_image_paths[page_num], page_md,
                         temp_dir_path / "review_crops" / f"page_{page_num}",
-                        log_func=lambda message, number=page_num: print(f"    -> [Page {number}] {message}"),
+                        log_func=lambda message, number=page_num: _emit_log(f"    -> [Trang {number}] {message}"),
+                        before_request=_before_qwen_request,
                         regions=review_regions.get(page_num),
                         graphic_regions=review_graphics.get(page_num),
                         block_spans=review_block_spans.get(page_num) or None,
                         review_document_footer=False,
                         quality_score=review_quality_scores.get(page_num),
                     )
+                except PipelineCancelled:
+                    raise
                 except Exception as review_error:
-                    print(f"    -> [Warning] Image-grounded review failed on page {page_num}; kept OCR result: {review_error}")
+                    _emit_log(f"    -> [Cảnh báo] Kiểm tra ảnh trang {page_num} thất bại; giữ OCR ban đầu: {review_error}")
             reviewed_results.append((page_num, page_md, error))
         results = reviewed_results
+
         from app.core.quality_gate import validate_page_numbers
         page_report = validate_page_numbers([page_num for page_num, _, _ in results], total_pages)
-        if not page_report.passed:
+        if not page_report.passed and (stop_event is None or not stop_event.is_set()):
             raise RuntimeError("OCR document quality gate failed: " + ", ".join(page_report.errors))
         failures = [(page_num, error) for page_num, _, error in results if error]
         if failures:
@@ -3281,32 +3415,38 @@ def process_single_pdf(
             for p_num, p_md, _ in results if p_md and p_md.strip()
         ]
 
-        # An all-blank document must produce a truly empty file. Building the
-        # trailing newline conditionally also preserves that guarantee if the
-        # optional Markdown finalizer raises and the fallback value is written.
+        # An all-blank document must produce a truly empty file.
+        _emit_event("stage_status", "Lưu kết quả")
+        _emit_event("stage_progress", 98)
+
         final_md = "\n\n".join(ocr_contents)
         if final_md:
             final_md += "\n"
         finalization_report = {"spelling_warnings": []}
         try:
-            final_md, finalization_report = finalize_markdown(final_md, return_report=True)
-            print("    -> Hậu xử lý Markdown:")
+            final_md, finalization_report = finalize_markdown(
+                final_md, return_report=True, spell_correct=spell_correct
+            )
+            _emit_log("  - Hậu xử lý Markdown:")
             for report_line in format_finalization_report(finalization_report):
-                print(f"       - {report_line}")
+                _emit_log(f"    + {report_line}")
         except Exception as merge_err:
-            print(f"    -> [Warning] Failed to finalize Markdown: {merge_err}")
+            _emit_log(f"    -> [Chú ý] Không thể hoàn thiện Markdown: {merge_err}")
+
         write_started_at = perf_counter()
         temp_output_path.write_text(final_md, encoding="utf-8")
         os.replace(temp_output_path, output_path)
+        _emit_event("stage_progress", 100)
+
         write_seconds = perf_counter() - write_started_at
-        print(f"Saved OCR to {output_path}")
-        print(f"Write benchmark: {write_seconds:.3f}s")
-        print(f"Trang trắng đã bỏ: {len(blank_page_numbers)}")
-        print(f"Trang chỉ có chữ ký/con dấu đã bỏ: {len(signature_only_page_numbers)}")
-        print(f"Trang không chắc chắn được giữ để OCR: {len(uncertain_page_numbers)}")
+        _emit_log(f"  - Đã lưu kết quả tại: {output_path.name}")
+        _emit_log(f"  - Benchmark ghi file: {write_seconds:.3f}s")
+        _emit_log(f"  - Trang trắng đã bỏ: {len(blank_page_numbers)}")
+        _emit_log(f"  - Trang chỉ có chữ ký/con dấu đã bỏ: {len(signature_only_page_numbers)}")
+        _emit_log(f"  - Trang không chắc chắn được giữ để OCR: {len(uncertain_page_numbers)}")
         document_elapsed = perf_counter() - document_started_at
         average = document_elapsed / total_pages if total_pages else 0.0
-        print(f"Performance: workers={workers}, total={document_elapsed:.2f}s, average={average:.2f}s/page")
+        _emit_log(f"  - Tổng thời gian OCR file: {format_elapsed(document_elapsed)}")
         clear_gpu_cache()
         return output_path
 

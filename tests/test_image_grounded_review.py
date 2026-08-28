@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+# pyrefly: ignore [missing-import]
 from PIL import Image
 
 from app.core.image_grounded_review import (
@@ -139,8 +140,8 @@ class ImageGroundedReviewTests(unittest.TestCase):
 
     def test_detects_malformed_date_but_not_valid_date(self):
         markdown = (
-            "Dak Ta Ley, ngày 4.8.. tháng 6 năm 2007\n"
-            "Dak Ta Ley, ngày 25 tháng 5 năm 2007"
+            "Hà Nội, ngày 4.8.. tháng 6 năm 2007\n"
+            "Hà Nội, ngày 25 tháng 5 năm 2007"
         )
         candidates = find_suspicious_lines(markdown)
         self.assertEqual([item.index for item in candidates], [0])

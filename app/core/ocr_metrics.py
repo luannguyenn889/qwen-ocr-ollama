@@ -32,12 +32,22 @@ def _distance(expected: list[str], actual: list[str]) -> int:
     return previous[-1]
 
 
+import difflib
+
 # Hàm tính tỷ lệ lỗi chung giữa hai tập hợp phần tử
 def error_rate(expected: Iterable[str], actual: Iterable[str]) -> float:
     """Tính tỷ lệ lỗi dựa trên khoảng cách Levenshtein chia cho tổng số phần tử kỳ vọng."""
     expected_items, actual_items = list(expected), list(actual)
     if not expected_items:
         return 0.0 if not actual_items else 1.0
+    if expected_items == actual_items:
+        return 0.0
+    # Tối ưu hóa tốc độ cho các văn bản dài (hàng chục nghìn ký tự)
+    if len(expected_items) * len(actual_items) > 10_000:
+        matcher = difflib.SequenceMatcher(None, expected_items, actual_items)
+        matching_count = sum(block.size for block in matcher.get_matching_blocks())
+        edit_dist = max(len(expected_items), len(actual_items)) - matching_count
+        return min(1.0, max(0.0, edit_dist / len(expected_items)))
     return _distance(expected_items, actual_items) / len(expected_items)
 
 
@@ -67,7 +77,7 @@ def _f1(expected: Counter[str], actual: Counter[str]) -> float:
 
 
 # Biểu thức chính quy cho biểu thức toán học và số
-MATH_RE = re.compile(r"\$\$(.+?)\$$|\$(.+?)\$", re.DOTALL)
+MATH_RE = re.compile(r"\$\$([^$]+?)\$\$|\$([^$\n]+?)\$")
 NUMBER_RE = re.compile(r"(?<![\w.])-?\d+(?:[.,]\d+)?(?:%|\b)")
 
 

@@ -51,6 +51,7 @@ _SCAN_ARTIFACT_RE = re.compile(
     r")\s*$",
     re.IGNORECASE,
 )
+_EMPTY_PIPE_ROW_RE = re.compile(r"^\s*\|\s*(?:\|\s*)+\s*$")
 
 
 
@@ -302,7 +303,7 @@ def remove_standalone_page_artifacts(
             re.fullmatch(r"\s*(?:\*\*)?\d{1,3}(?:\*\*)?\s*", line)
             and _MAGAZINE_FOOTER_RE.fullmatch(next_nonblank)
         )
-        is_scan_artifact = bool(_SCAN_ARTIFACT_RE.fullmatch(line))
+        is_scan_artifact = bool(_SCAN_ARTIFACT_RE.fullmatch(line) or _EMPTY_PIPE_ROW_RE.fullmatch(line))
         if is_footer or number_before_footer or is_scan_artifact:
             if stats is not None:
                 stats.page_artifacts_removed += 1
@@ -646,6 +647,10 @@ def normalize_orphan_pipes(markdown: str) -> str:
         )
         if protected or "|" not in line:
             output.append(line)
+            continue
+
+        # 0. Pure empty pipe rows: "| | | | | | |" or "| |"
+        if _EMPTY_PIPE_ROW_RE.fullmatch(line):
             continue
 
         # 1. Document metadata / header lines: "Số: 57/TTr - UBND | Ya Hội, ngày 28 tháng 6 năm 2016"

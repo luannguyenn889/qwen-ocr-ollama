@@ -92,6 +92,69 @@ class GuiWorkerControlTests(unittest.TestCase):
         self.assertTrue(app.stop_event.is_set())
         self.assertTrue(app.resume_event.is_set())
 
+    def test_ocr_worker_delegates_to_process_single_pdf(self):
+        from unittest.mock import patch
+        progress_q = queue.Queue()
+        stop_event = threading.Event()
+        resume_event = threading.Event()
+        resume_event.set()
+
+        fake_pdf = Path("test_doc.pdf")
+        with patch.object(Path, "is_file", return_value=True), \
+             patch.object(Path, "is_dir", return_value=False), \
+             patch("app.gui.run_gui.process_single_pdf") as mock_process:
+            mock_process.return_value = Path("OCR/test_doc.md")
+
+            worker = OCRWorker(
+                fake_pdf, Path("OCR"), progress_q,
+                stop_event, resume_event, "qwen3.5:4b", workers=1,
+            )
+            worker.run()
+
+            self.assertTrue(mock_process.called)
+            call_kwargs = mock_process.call_args[1]
+            self.assertEqual(call_kwargs["pdf_path"], fake_pdf)
+            self.assertEqual(call_kwargs["output_dir"], Path("OCR"))
+            self.assertEqual(call_kwargs["stop_event"], stop_event)
+            self.assertEqual(call_kwargs["resume_event"], resume_event)
+
+        # Check queue events emitted
+        events = []
+        while not progress_q.empty():
+            events.append(progress_q.get_nowait())
+
+        event_types = [e[0] for e in events]
+        self.assertIn("file_progress", event_types)
+        self.assertIn("finished", event_types)
+        self.assertEqual(events[-1], ("finished", "completed"))
+
+    def test_app_gui_poll_queue_page_sub_progress(self):
+        app = AppGUI.__new__(AppGUI)
+        app.progress_queue = queue.Queue()
+        app.page_progressbar = {}
+        app.file_progressbar = {}
+        app.page_progress_var = Mock()
+        app.file_progress_var = Mock()
+        app.stats_active_var = Mock()
+        app._page_sub_progress = {}
+        app._page_sub_labels = {}
+        app._pages_done = 0
+        app._total_pages = 2
+        app._current_stage_text = "Chuẩn bị"
+        app.log_text = Mock()
+        app.root = Mock()
+        app._is_running = True
+        app.active_page_timers = {}
+
+        # Put sub progress message
+        app.progress_queue.put(("page_sub_progress", (1, 0.50, "Qwen Vision OCR")))
+        app.poll_queue()
+
+        self.assertAlmostEqual(app.page_progressbar["value"], 25.0)
+        app.page_progress_var.set.assert_called_with("Trang: 25% (0/2 trang) — Qwen Vision OCR")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
