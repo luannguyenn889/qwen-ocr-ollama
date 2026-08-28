@@ -14,10 +14,18 @@ from typing import Any
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 os.environ.setdefault("GLOG_minloglevel", "3")
 
+import builtins
 # pyrefly: ignore [missing-import]
 import numpy as np
 # pyrefly: ignore [missing-import]
 from PIL import Image, ImageDraw
+
+try:
+    # pyrefly: ignore [missing-import]
+    import cv2
+    builtins.cv2 = cv2
+except Exception:
+    pass
 
 BoundingBox = tuple[float, float, float, float]
 

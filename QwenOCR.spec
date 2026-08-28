@@ -13,12 +13,13 @@ cython_datas, cython_binaries, cython_hiddenimports = collect_all('Cython')
 pyclipper_datas, pyclipper_binaries, pyclipper_hiddenimports = collect_all('pyclipper')
 shapely_datas, shapely_binaries, shapely_hiddenimports = collect_all('shapely')
 skimage_datas, skimage_binaries, skimage_hiddenimports = collect_all('skimage')
+cv2_datas, cv2_binaries, cv2_hiddenimports = collect_all('cv2')
 
 added_files = [
     ('app/core/vietnamese_lexicon.json', 'app/core'),
-] + paddlex_datas + paddle_datas + paddleocr_datas + cython_datas + pyclipper_datas + shapely_datas + skimage_datas
+] + paddlex_datas + paddle_datas + paddleocr_datas + cython_datas + pyclipper_datas + shapely_datas + skimage_datas + cv2_datas
 
-all_binaries = paddlex_binaries + paddle_binaries + paddleocr_binaries + cython_binaries + pyclipper_binaries + shapely_binaries + skimage_binaries
+all_binaries = paddlex_binaries + paddle_binaries + paddleocr_binaries + cython_binaries + pyclipper_binaries + shapely_binaries + skimage_binaries + cv2_binaries
 
 hidden_imports = [
     'paddle',
@@ -53,7 +54,7 @@ hidden_imports = [
     'app.core.formula_ocr',
     'app.gui',
     'app.gui.run_gui',
-] + paddlex_hiddenimports + paddle_hiddenimports + paddleocr_hiddenimports + cython_hiddenimports + pyclipper_hiddenimports + shapely_hiddenimports + skimage_hiddenimports
+] + paddlex_hiddenimports + paddle_hiddenimports + paddleocr_hiddenimports + cython_hiddenimports + pyclipper_hiddenimports + shapely_hiddenimports + skimage_hiddenimports + cv2_hiddenimports
 
 a = Analysis(
     ['run_gui.py'],
