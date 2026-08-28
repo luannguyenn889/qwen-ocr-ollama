@@ -219,6 +219,16 @@ class LayoutDetector:
     _layout_detector: Any = None
 
     def __post_init__(self) -> None:
+        # Bypass PyInstaller missing .dist-info metadata check in PaddleX
+        try:
+            # pyrefly: ignore [missing-import]
+            import paddlex.utils.deps as pdx_deps
+            pdx_deps.is_dep_available = lambda *a, **k: True
+            pdx_deps.require_deps = lambda *a, **k: None
+            pdx_deps.require_extra = lambda *a, **k: None
+        except Exception:
+            pass
+
         # pyrefly: ignore [missing-import]
         from paddleocr import LayoutDetection, TextDetection
 

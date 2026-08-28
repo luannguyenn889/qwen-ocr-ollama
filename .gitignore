@@ -10,8 +10,14 @@ __pycache__/
 *$py.class
 *.so
 *.egg-info/
+*.egg
+
+# PyInstaller build artifacts
 dist/
 build/
+*.manifest
+*.spec.bak
+*.pkg
 
 # Testing & Coverage
 .pytest_cache/
@@ -27,9 +33,11 @@ temp/
 scratch/
 *.tmp
 *.tmp.*
+*.bak
 tmp_*.png
 tmp_*.jpg
 tmp_test_*.png
+review_crops/
 
 # Model & framework caches
 .cache/
@@ -44,17 +52,19 @@ scanpdf/
 res/
 OCR_output/
 test_hybrid_out/
+test_input/
 test_output/
 scratch_images/
 layout_debug/
 images/
 file_chuaxoatrangtrang/
 
-# Generated image files
+# Generated image & log files
 page_*.png
 *_layout.png
 test.*
 *.log
+*.jsonl
 
 # Environment variables / secrets
 .env
@@ -75,4 +85,3 @@ test.*
 Thumbs.db
 ehthumbs.db
 Desktop.ini
-
